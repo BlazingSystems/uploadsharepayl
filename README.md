@@ -2,7 +2,7 @@
 
 This repository is retired and is not part of the active BlazingSystems portfolio.
 
-The current branch is intentionally limited to this archival notice.
+The current `main` branch was rebuilt as a minimal archival record and contains no maintained application payloads.
 
 Maintained work is organized in:
 
