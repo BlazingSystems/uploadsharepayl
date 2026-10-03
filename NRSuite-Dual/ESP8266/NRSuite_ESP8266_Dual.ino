@@ -939,6 +939,24 @@ void handleProtocolCommand(uint8_t id, const String& payload) {
       F(",\"dropped\":") + deauthDropped);
     return;
   }
+  if (cmd == "START_CLIENT_DETECT") {
+    String mode = jsonStringValue(payload, "mode", "fixed");
+    bool hop = jsonBoolValue(payload, "hop", mode == "hop");
+    int ch = (int)jsonIntValue(payload, "channel", wifi_get_channel());
+    int interval = (int)jsonIntValue(payload, "interval_ms", NR_MON_DEFAULT_MS);
+    bool ok = startMonitor(MON_CLIENT, ch, hop, interval, false);
+    sendResponse(id, ok, String(F("\"channel\":")) + monitorChannel + F(",\"hopping\":") + (monitorHop ? F("true") : F("false")));
+    return;
+  }
+  if (cmd == "STOP_CLIENT_DETECT") {
+    stopMonitor(true);
+    sendResponse(id, true,
+      String(F("\"captured\":")) + clientSeen +
+      F(",\"sent\":") + clientSeen +
+      F(",\"dropped\":") + clientDropped);
+    return;
+  }
+
   if (cmd == "START_HIDDEN_AP") {
     String mode = jsonStringValue(payload, "mode", "fixed");
     bool hop = jsonBoolValue(payload, "hop", mode == "hop");
@@ -982,13 +1000,14 @@ button{cursor:pointer;background:#263244;font-weight:650;margin-top:8px}button:h
 table{width:100%;border-collapse:collapse;font-size:.76rem}th,td{text-align:left;border-bottom:1px solid #29303d;padding:6px}.wide{grid-column:1/-1}
 </style></head><body>
 <div class="top"><h1>NRSuite ESP8266 Dual</h1><span class="tag">App serial + Web UI</span></div>
-<p class="muted">Defensive port: Wi-Fi scan, passive deauth detection, hidden-AP observation, and AP/STA/NAPT management. Active attack modules are disabled.</p>
+<p class="muted">Dual-control ESP8266 port: Wi-Fi reconnaissance, passive client/deauth/hidden-AP telemetry, AP/STA/NAPT management, recovery controls, and authenticated web firmware update.</p>
 <div class="grid">
 <section class="card"><h2>Status</h2><pre id="status">Loading…</pre><button onclick="loadStatus()">Refresh</button></section>
 <section class="card"><h2>Network mode</h2><form id="wifi" onsubmit="saveWifi(event)"><label>Mode</label><select name="mode"><option value="0">AP only</option><option value="1">STA only (+fallback AP)</option><option value="2">AP + STA</option><option value="3">AP + STA Internet Repeater (NAPT)</option></select><label>Upstream SSID</label><input name="sta_ssid" maxlength="32"><label>Upstream password</label><input name="sta_pass" type="password" maxlength="64"><label>Management AP SSID</label><input name="ap_ssid" maxlength="32"><label>Management AP password (8+)</label><input name="ap_pass" type="password" maxlength="64"><div class="row"><div><label>AP channel</label><input name="channel" type="number" min="1" max="13"></div><div><label>Admin user</label><input name="admin_user" maxlength="16"></div></div><label>Admin password (8+)</label><input name="admin_pass" type="password" maxlength="32"><button>Save & apply</button></form><p class="muted">Changing credentials can disconnect this browser.</p></section>
 <section class="card wide"><h2>Wi-Fi scan</h2><button onclick="scanWifi()">Scan nearby APs</button><div id="scan" class="muted">No scan yet.</div></section>
-<section class="card"><h2>Passive defense</h2><div class="row"><button onclick="monitor('deauth')">Deauth detector</button><button onclick="monitor('hidden')">Hidden AP</button></div><button onclick="monitor('stop')">Stop monitor</button><p class="muted">Fixed-channel monitoring stays compatible with the web link. Channel hopping is available through the Android serial protocol because ESP8266 has one 2.4 GHz radio.</p></section>
-<section class="card"><h2>Recent alerts</h2><pre id="events">Loading…</pre><button onclick="loadEvents()">Refresh</button></section>
+<section class="card"><h2>Passive defense</h2><div class="row"><button onclick="monitor('deauth')">Deauth detector</button><button onclick="monitor('hidden')">Hidden AP</button></div><button onclick="monitor('client')">Client presence</button><button onclick="monitor('stop')">Stop monitor</button><p class="muted">Fixed-channel monitoring stays compatible with the web link. Channel hopping is available through the Android serial protocol because ESP8266 has one 2.4 GHz radio.</p></section>
+<section class="card"><h2>Maintenance</h2><a href="/update"><button>Firmware update</button></a><div class="row"><button onclick="action('/api/reboot','Reboot device?')">Reboot</button><button onclick="action('/api/factory','Factory reset?')">Factory reset</button></div><p class="muted">Firmware update uses the same web username/password. Factory reset restores the default AP and admin credentials.</p></section>
+<section class="card wide"><h2>Recent alerts</h2><pre id="events">Loading…</pre><div class="row"><button onclick="loadEvents()">Refresh</button><a href="/api/events.csv"><button>Export CSV</button></a></div></section>
 </div>
 <script>
 async function j(u,o){let r=await fetch(u,o);let t=await r.text();try{return JSON.parse(t)}catch(e){return {ok:false,msg:t}}}
@@ -997,6 +1016,7 @@ async function loadStatus(){let x=await j('/api/status');document.querySelector(
 async function saveWifi(e){e.preventDefault();let b=new URLSearchParams(new FormData(e.target));let x=await j('/api/wifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});alert(x.msg||JSON.stringify(x));setTimeout(()=>location.reload(),1800)}
 async function scanWifi(){let d=document.querySelector('#scan');d.textContent='Scanning…';let x=await j('/api/scan');if(!x.ok){d.textContent=x.msg||'Scan failed';return}let h='<table><tr><th>SSID</th><th>RSSI</th><th>Ch</th><th>Security</th><th>BSSID</th></tr>';for(let n of x.networks)h+='<tr><td>'+esc(n.ssid||'(hidden)')+'</td><td>'+n.rssi+'</td><td>'+n.channel+'</td><td>'+esc(n.security)+'</td><td>'+esc(n.bssid)+'</td></tr>';d.innerHTML=h+'</table>'}
 async function monitor(k){let b=new URLSearchParams({kind:k});let x=await j('/api/monitor',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});alert(x.msg||JSON.stringify(x));loadStatus();loadEvents()}
+async function action(u,q){if(!confirm(q))return;let x=await j(u,{method:'POST'});alert(x.msg||JSON.stringify(x))}
 async function loadEvents(){let x=await j('/api/events');document.querySelector('#events').textContent=(x.events||[]).map(e=>'['+(e.ms/1000).toFixed(1)+'s] '+e.text).join('\n')||'No alerts.'}
 loadStatus();loadEvents();setInterval(()=>{loadStatus();loadEvents()},5000)
 </script></body></html>
@@ -1067,6 +1087,9 @@ void setupWeb() {
     } else if (kind == "hidden") {
       startMonitor(MON_HIDDEN, ch, false, NR_MON_DEFAULT_MS, true);
       server.send(200, "application/json", F("{\"ok\":true,\"msg\":\"passive hidden-AP observer started\"}"));
+    } else if (kind == "client") {
+      startMonitor(MON_CLIENT, ch, false, NR_MON_DEFAULT_MS, true);
+      server.send(200, "application/json", F("{\"ok\":true,\"msg\":\"passive client detector started\"}"));
     } else {
       server.send(400, "application/json", F("{\"ok\":false,\"msg\":\"unknown monitor kind\"}"));
     }
