@@ -1064,6 +1064,37 @@ void setupWeb() {
     server.send(200, "application/json", j);
   });
 
+  server.on("/api/events.csv", HTTP_GET, []() {
+    if (!authOk()) return;
+    String csv = F("uptime_ms,event\r\n");
+    csv.reserve(1024);
+    for (uint8_t i = 0; i < NR_EVENT_LOG_SIZE; ++i) {
+      uint8_t idx = (eventLogHead + i) % NR_EVENT_LOG_SIZE;
+      if (!eventLog[idx].text.length()) continue;
+      String line = eventLog[idx].text;
+      line.replace("\"", "\"\"");
+      csv += String(eventLog[idx].ms) + F(",\"") + line + F("\"\r\n");
+    }
+    server.sendHeader("Content-Disposition", "attachment; filename=nrsuite-events.csv");
+    server.send(200, "text/csv; charset=utf-8", csv);
+  });
+
+  server.on("/api/reboot", HTTP_POST, []() {
+    if (!authOk()) return;
+    server.send(200, "application/json", F("{\"ok\":true,\"msg\":\"rebooting\"}"));
+    delay(120);
+    ESP.restart();
+  });
+
+  server.on("/api/factory", HTTP_POST, []() {
+    if (!authOk()) return;
+    setDefaultConfig();
+    saveConfig();
+    server.send(200, "application/json", F("{\"ok\":true,\"msg\":\"factory defaults restored; rebooting\"}"));
+    delay(120);
+    ESP.restart();
+  });
+
   server.on("/api/scan", HTTP_GET, []() {
     if (!authOk()) return;
     int count = 0;
@@ -1119,11 +1150,14 @@ void setupWeb() {
     strlcpy(cfg.adminUser, adminUser.c_str(), sizeof(cfg.adminUser));
     if (adminPass.length()) strlcpy(cfg.adminPass, adminPass.c_str(), sizeof(cfg.adminPass));
     saveConfig();
+    httpUpdater.updateCredentials(cfg.adminUser, cfg.adminPass);
     server.send(200, "application/json", F("{\"ok\":true,\"msg\":\"saved; applying network settings\"}"));
     delay(100);
     stopMonitor(false);
     applyNetworkConfig();
   });
+
+  httpUpdater.setup(&server, "/update", cfg.adminUser, cfg.adminPass);
 
   server.onNotFound([]() {
     if (!authOk()) return;
