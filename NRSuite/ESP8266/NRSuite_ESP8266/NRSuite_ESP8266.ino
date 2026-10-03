@@ -483,4 +483,242 @@ static void promiscuousCb(uint8_t* buf, uint16_t len) {
       return;
     }
     if (subtype == 0x04) {
-      
+      bool present = false;
+      bool hasSsid = parseSsidIe(frame, frameLen, 24, ev.ssid, sizeof(ev.ssid), &present);
+      if (!hasSsid || !present) return;
+      ev.type = EV_HIDDEN_CANDIDATE;
+      queueMonitorEvent(ev);
+      return;
+    }
+    if (subtype == 0x00 || subtype == 0x02) {
+      size_t off = subtype == 0x00 ? 28 : 34;
+      bool present = false;
+      bool hasSsid = parseSsidIe(frame, frameLen, off, ev.ssid, sizeof(ev.ssid), &present);
+      if (!hasSsid || !present) return;
+      ev.type = EV_HIDDEN_RESOLVED;
+      queueMonitorEvent(ev);
+      return;
+    }
+  }
+}
+
+static void rememberHidden(const uint8_t* bssid) {
+  uint32_t now = millis();
+  int empty = -1;
+  int oldest = 0;
+  uint32_t oldestMs = 0xFFFFFFFFUL;
+  for (int i = 0; i < NR_HIDDEN_CACHE; ++i) {
+    if (hiddenCache[i].used && memcmp(hiddenCache[i].bssid, bssid, 6) == 0) {
+      hiddenCache[i].lastSeen = now;
+      return;
+    }
+    if (!hiddenCache[i].used && empty < 0) empty = i;
+    if (hiddenCache[i].used && hiddenCache[i].lastSeen < oldestMs) {
+      oldestMs = hiddenCache[i].lastSeen;
+      oldest = i;
+    }
+  }
+  int slot = empty >= 0 ? empty : oldest;
+  hiddenCache[slot].used = true;
+  memcpy(hiddenCache[slot].bssid, bssid, 6);
+  hiddenCache[slot].lastSeen = now;
+}
+
+static bool isKnownHidden(const uint8_t* bssid) {
+  for (int i = 0; i < NR_HIDDEN_CACHE; ++i) {
+    if (hiddenCache[i].used && memcmp(hiddenCache[i].bssid, bssid, 6) == 0) return true;
+  }
+  return false;
+}
+
+// -----------------------------------------------------------------------------
+// Web event ring
+// -----------------------------------------------------------------------------
+String webEvents[NR_MAX_WEB_EVENTS];
+uint8_t webEventHead = 0;
+uint8_t webEventCount = 0;
+
+static void logWebEvent(const String& json) {
+  webEvents[webEventHead] = json;
+  webEventHead = (webEventHead + 1) % NR_MAX_WEB_EVENTS;
+  if (webEventCount < NR_MAX_WEB_EVENTS) ++webEventCount;
+}
+
+// -----------------------------------------------------------------------------
+// Network / web server
+// -----------------------------------------------------------------------------
+ESP8266WebServer web(80);
+DNSServer dns;
+bool webStarted = false;
+bool dnsStarted = false;
+bool naptEnabled = false;
+uint32_t lastNetworkService = 0;
+
+static const IPAddress AP_IP(192, 168, 50, 1);
+static const IPAddress AP_GW(192, 168, 50, 1);
+static const IPAddress AP_MASK(255, 255, 255, 0);
+
+static bool hasApMode() {
+  return cfg.networkMode == NET_AP_ONLY || cfg.networkMode == NET_AP_STA || cfg.networkMode == NET_REPEATER;
+}
+
+static bool hasStaMode() {
+  return cfg.networkMode == NET_STA_ONLY || cfg.networkMode == NET_AP_STA || cfg.networkMode == NET_REPEATER;
+}
+
+static String networkModeName() {
+  switch (cfg.networkMode) {
+    case NET_AP_ONLY: return F("AP");
+    case NET_STA_ONLY: return F("STA");
+    case NET_AP_STA: return F("AP+STA");
+    case NET_REPEATER: return F("AP+STA Repeater");
+    default: return F("Unknown");
+  }
+}
+
+static void stopDns() {
+  if (dnsStarted) {
+    dns.stop();
+    dnsStarted = false;
+  }
+}
+
+static void stopNapt() {
+#if NR_HAS_NAPT
+  if (naptEnabled) {
+    ip_napt_enable_no(SOFTAP_IF, 0);
+    naptEnabled = false;
+  }
+#else
+  naptEnabled = false;
+#endif
+}
+
+static void startWebIfNeeded();
+
+static void applyNetworkConfig() {
+  stopDns();
+  stopNapt();
+  wifi_promiscuous_enable(0);
+  delay(1);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+
+  if (cfg.networkMode == NET_AP_ONLY) WiFi.mode(WIFI_AP);
+  else if (cfg.networkMode == NET_STA_ONLY) WiFi.mode(WIFI_STA);
+  else WiFi.mode(WIFI_AP_STA);
+
+  if (hasStaMode() && cfg.staSsid[0]) {
+    WiFi.begin(cfg.staSsid, cfg.staPass);
+  } else if (hasStaMode()) {
+    WiFi.disconnect();
+  }
+
+  if (hasApMode()) {
+    WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
+    size_t passLen = strlen(cfg.apPass);
+    if (passLen >= 8) WiFi.softAP(cfg.apSsid, cfg.apPass);
+    else WiFi.softAP(cfg.apSsid);
+    dns.setErrorReplyCode(DNSReplyCode::NoError);
+    dns.start(53, "*", AP_IP);
+    dnsStarted = true;
+  }
+
+  startWebIfNeeded();
+}
+
+static void serviceNapt() {
+  if (cfg.networkMode != NET_REPEATER || monitorMode != MON_NONE) {
+    stopNapt();
+    return;
+  }
+#if NR_HAS_NAPT
+  if (WiFi.status() == WL_CONNECTED && !naptEnabled) {
+    auto& dhcp = WiFi.softAPDhcpServer();
+    IPAddress upstreamDns = WiFi.dnsIP(0);
+    if (upstreamDns != IPAddress(0, 0, 0, 0)) dhcp.setDns(upstreamDns);
+    err_t ret = ip_napt_init(NR_NAPT_ENTRIES, NR_NAPT_PORTMAP);
+    if (ret == ERR_OK) {
+      ret = ip_napt_enable_no(SOFTAP_IF, 1);
+      naptEnabled = (ret == ERR_OK);
+    }
+  }
+#else
+  naptEnabled = false;
+#endif
+}
+
+// -----------------------------------------------------------------------------
+// Monitor lifecycle - suspends web/AP/STA because ESP8266 promiscuous mode is
+// not a reliable concurrent range-extender transport.
+// -----------------------------------------------------------------------------
+static bool startMonitor(MonitorMode mode, uint8_t channel, bool hop,
+                         uint16_t hopInterval, int8_t rssiMin,
+                         uint32_t autoDurationMs = 0) {
+  if (mode == MON_NONE) return false;
+  if (channel < 1 || channel > 13) channel = 1;
+  if (hopInterval < 50) hopInterval = 50;
+  if (hopInterval > 5000) hopInterval = 5000;
+  if (rssiMin < -100) rssiMin = -100;
+  if (rssiMin > -10) rssiMin = -10;
+
+  if (monitorMode != MON_NONE) {
+    wifi_promiscuous_enable(0);
+    monitorMode = MON_NONE;
+  }
+
+  stopDns();
+  stopNapt();
+  WiFi.disconnect(true);
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(20);
+
+  wifi_set_opmode(STATION_MODE);
+  wifi_promiscuous_enable(0);
+  wifi_set_promiscuous_rx_cb(promiscuousCb);
+  monitorMode = mode;
+  monitorHop = hop;
+  monitorChannel = hop ? 1 : channel;
+  monitorHopIntervalMs = hopInterval;
+  monitorRssiMin = rssiMin;
+  monitorLastHop = millis();
+  monitorAutoStopAt = autoDurationMs ? millis() + autoDurationMs : 0;
+  monitorDetected = monitorSent = monitorDropped = 0;
+  hiddenSeen = hiddenCandidates = hiddenResolved = 0;
+  pendingHead = pendingTail = 0;
+  memset(hiddenCache, 0, sizeof(hiddenCache));
+  wifi_set_channel(monitorChannel);
+  wifi_promiscuous_enable(1);
+  return true;
+}
+
+static void stopMonitor(bool restoreNetwork = true) {
+  if (monitorMode != MON_NONE) {
+    wifi_promiscuous_enable(0);
+    wifi_set_promiscuous_rx_cb(nullptr);
+    monitorMode = MON_NONE;
+    monitorAutoStopAt = 0;
+    deauthFilterHasBssid = false;
+    deauthFilterHasClient = false;
+    delay(10);
+  }
+  if (restoreNetwork) applyNetworkConfig();
+}
+
+static const char* subtypeName(uint8_t subtype) {
+  switch (subtype) {
+    case 0x00: return "assoc";
+    case 0x02: return "reassoc";
+    case 0x04: return "probe";
+    case 0x0A: return "disassoc";
+    case 0x0B: return "auth";
+    case 0x0C: return "deauth";
+    default: return "mgmt";
+  }
+}
+
+static void emitMonitorEvent(MonitorEvent& ev) {
+  char a1[18], a2[18], bssid[18];
+  macToString(ev.addr1, a1);
+  macToString(ev.addr2, a2);
