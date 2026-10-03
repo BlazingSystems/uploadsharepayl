@@ -378,3 +378,193 @@ void sendResponse(uint8_t id, bool ok, const String& extra = "", const String& m
     if (extra[0] != ',') j += ',';
     j += extra;
   }
+  j += '}';
+  sendJsonFrame(TYPE_RESP, id, j);
+}
+
+void sendEvent(const char* type, const String& fields) {
+  String j = String(F("{\"type\":\"")) + type + '"';
+  if (fields.length()) {
+    if (fields[0] != ',') j += ',';
+    j += fields;
+  }
+  j += '}';
+  sendJsonFrame(TYPE_EVENT, 0, j);
+}
+
+void protoResync() {
+  if (protoRxLen < 2) { protoRxLen = 0; return; }
+  for (uint16_t i = 1; i + 1 < protoRxLen; ++i) {
+    if (protoRx[i] == NR_PROTO_MAGIC0 && protoRx[i + 1] == NR_PROTO_MAGIC1) {
+      memmove(protoRx, protoRx + i, protoRxLen - i);
+      protoRxLen -= i;
+      return;
+    }
+  }
+  protoRxLen = 0;
+}
+
+void handleProtocolCommand(uint8_t id, const String& payload);
+
+bool protoTryParse() {
+  if (protoRxLen < NR_PROTO_HEADER) return false;
+  if (protoRx[0] != NR_PROTO_MAGIC0 || protoRx[1] != NR_PROTO_MAGIC1) {
+    protoResync();
+    return protoRxLen >= NR_PROTO_HEADER;
+  }
+  uint8_t type = protoRx[2];
+  uint8_t id = protoRx[3];
+  uint32_t len = (uint32_t)protoRx[4] |
+                 ((uint32_t)protoRx[5] << 8) |
+                 ((uint32_t)protoRx[6] << 16) |
+                 ((uint32_t)protoRx[7] << 24);
+  if (len > NR_PROTO_MAX) {
+    protoOversized++;
+    protoResync();
+    return protoRxLen >= NR_PROTO_HEADER;
+  }
+  uint32_t total = NR_PROTO_HEADER + len;
+  if (protoRxLen < total) return false;
+
+  if (type == TYPE_CMD) {
+    String payload;
+    payload.reserve(len + 1);
+    for (uint32_t i = 0; i < len; ++i) payload += (char)protoRx[NR_PROTO_HEADER + i];
+    handleProtocolCommand(id, payload);
+  }
+  // ACK/PCAP/HTML are intentionally ignored in this ESP8266-safe subset.
+
+  memmove(protoRx, protoRx + total, protoRxLen - total);
+  protoRxLen -= total;
+  return protoRxLen >= NR_PROTO_HEADER;
+}
+
+void protoUpdate() {
+  while (Serial.available()) {
+    int c = Serial.read();
+    if (c < 0) break;
+    if (protoRxLen < sizeof(protoRx)) protoRx[protoRxLen++] = (uint8_t)c;
+    else {
+      protoOversized++;
+      protoResync();
+    }
+    while (protoTryParse()) yield();
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Wi-Fi network mode / NAPT
+// -----------------------------------------------------------------------------
+void stopDns() {
+  if (dnsRunning) {
+    dnsServer.stop();
+    dnsRunning = false;
+  }
+}
+
+void startDnsIfAp() {
+  stopDns();
+  WiFiMode_t m = WiFi.getMode();
+  if (m == WIFI_AP || m == WIFI_AP_STA) {
+    dnsServer.start(NR_DNS_PORT, "*", WiFi.softAPIP());
+    dnsRunning = true;
+  }
+}
+
+void disableNapt() {
+#if IP_NAPT
+  if (naptEnabled) {
+    ip_napt_enable_no(SOFTAP_IF, 0);
+    naptEnabled = false;
+  }
+#else
+  naptEnabled = false;
+#endif
+}
+
+bool enableNapt() {
+#if IP_NAPT
+  disableNapt();
+  err_t e = ip_napt_init(NR_NAPT_ENTRIES, NR_NAPT_PORTMAP);
+  if (e != ERR_OK) return false;
+  e = ip_napt_enable_no(SOFTAP_IF, 1);
+  naptEnabled = (e == ERR_OK);
+#if defined(ARDUINO_ESP8266_MAJOR) && ARDUINO_ESP8266_MAJOR >= 3
+  if (naptEnabled && WiFi.dnsIP(0) != IPAddress((uint32_t)0)) {
+    WiFi.softAPDhcpServer().setDns(WiFi.dnsIP(0));
+  }
+#endif
+  return naptEnabled;
+#else
+  naptEnabled = false;
+  return false;
+#endif
+}
+
+void startAp(bool fallback = false) {
+  IPAddress ip(192, 168, 4, 1), mask(255, 255, 255, 0);
+  WiFi.softAPConfig(ip, ip, mask);
+  const char* ssid = cfg.apSsid;
+  const char* pass = cfg.apPass;
+  if (fallback) {
+    static char fssid[33];
+    snprintf(fssid, sizeof(fssid), "NRSuite-Fallback-%06X", ESP.getChipId() & 0xFFFFFF);
+    ssid = fssid;
+  }
+  WiFi.softAP(ssid, pass, cfg.apChannel >= 1 && cfg.apChannel <= 13 ? cfg.apChannel : 1, false, 8);
+}
+
+bool connectSta(uint32_t timeoutMs) {
+  if (strlen(cfg.staSsid) == 0) return false;
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(cfg.staSsid, cfg.staPass);
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+    delay(25);
+    yield();
+    protoUpdate();
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+void applyNetworkConfig(bool fromMonitorRestore) {
+  (void)fromMonitorRestore;
+  stopDns();
+  disableNapt();
+  fallbackAp = false;
+  WiFi.disconnect(true);
+  WiFi.softAPdisconnect(true);
+  delay(50);
+
+  NetMode mode = (NetMode)cfg.netMode;
+  if (mode == NET_AP) {
+    WiFi.mode(WIFI_AP);
+    startAp(false);
+  } else if (mode == NET_STA) {
+    WiFi.mode(WIFI_STA);
+    if (!connectSta(NR_STA_TIMEOUT_MS)) {
+      WiFi.mode(WIFI_AP_STA);
+      startAp(true);
+      fallbackAp = true;
+    }
+  } else {
+    WiFi.mode(WIFI_AP_STA);
+    startAp(false);
+    bool ok = connectSta(NR_STA_TIMEOUT_MS);
+    if (!ok) {
+      fallbackAp = true;
+      // Keep the management AP up even without upstream.
+    } else if (mode == NET_REPEATER) {
+      enableNapt();
+    }
+  }
+  startDnsIfAp();
+  addEventLog(String(F("Network mode: ")) + netModeName(cfg.netMode));
+}
+
+void maintainNetwork() {
+  if (monitorNetworkSuspended) return;
+  if (cfg.netMode == NET_STA || cfg.netMode == NET_APSTA || cfg.netMode == NET_REPEATER) {
+    if (strlen(cfg.staSsid) && WiFi.status() != WL_CONNECTED && millis() - lastStaRetry > 15000UL) {
+      lastStaRetry = millis();
