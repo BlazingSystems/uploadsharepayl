@@ -722,3 +722,208 @@ static void emitMonitorEvent(MonitorEvent& ev) {
   char a1[18], a2[18], bssid[18];
   macToString(ev.addr1, a1);
   macToString(ev.addr2, a2);
+  macToString(ev.bssid, bssid);
+
+  JsonDocument doc;
+  const char* eventName = "debug";
+
+  if (ev.type == EV_DEAUTH) {
+    if (deauthFilterHasBssid &&
+        memcmp(ev.addr2, deauthFilterBssid, 6) != 0 &&
+        memcmp(ev.bssid, deauthFilterBssid, 6) != 0) return;
+    if (deauthFilterHasClient && memcmp(ev.addr1, deauthFilterClient, 6) != 0) return;
+    ++monitorDetected;
+    eventName = "deauth_detected";
+    doc["subtype"] = ev.subtype == 0x0C ? "deauth" : "disassoc";
+    doc["subtype_code"] = ev.subtype;
+    doc["bssid"] = bssid;
+    doc["source"] = a2;
+    doc["client"] = a1;
+    doc["destination"] = a1;
+    doc["channel"] = ev.channel;
+    doc["rssi"] = ev.rssi;
+    doc["reason"] = ev.reason;
+    doc["uptime_ms"] = ev.uptimeMs;
+  } else if (ev.type == EV_CLIENT) {
+    ++monitorDetected;
+    eventName = "client_detected";
+    doc["client"] = a2;
+    doc["bssid"] = bssid;
+    if (ev.ssid[0]) doc["ssid"] = ev.ssid;
+    doc["subtype"] = subtypeName(ev.subtype);
+    doc["rssi"] = ev.rssi;
+    doc["channel"] = ev.channel;
+  } else if (ev.type == EV_HIDDEN_AP) {
+    ++monitorDetected;
+    rememberHidden(ev.bssid);
+    ++hiddenSeen;
+    eventName = "hidden_ap";
+    doc["bssid"] = bssid;
+    doc["channel"] = ev.channel;
+    doc["rssi"] = ev.rssi;
+    doc["uptime_ms"] = ev.uptimeMs;
+    doc["subtype"] = subtypeName(ev.subtype);
+  } else if (ev.type == EV_HIDDEN_CANDIDATE) {
+    ++monitorDetected;
+    ++hiddenCandidates;
+    eventName = "hidden_ssid_candidate";
+    doc["client"] = a2;
+    doc["ssid"] = ev.ssid;
+    doc["channel"] = ev.channel;
+    doc["rssi"] = ev.rssi;
+    doc["uptime_ms"] = ev.uptimeMs;
+    doc["subtype"] = subtypeName(ev.subtype);
+  } else if (ev.type == EV_HIDDEN_RESOLVED) {
+    if (!isKnownHidden(ev.bssid)) return;
+    ++monitorDetected;
+    ++hiddenResolved;
+    eventName = "hidden_ssid_resolved";
+    doc["bssid"] = bssid;
+    doc["client"] = a2;
+    doc["ssid"] = ev.ssid;
+    doc["channel"] = ev.channel;
+    doc["rssi"] = ev.rssi;
+    doc["uptime_ms"] = ev.uptimeMs;
+    doc["subtype"] = subtypeName(ev.subtype);
+  } else {
+    return;
+  }
+
+  bridge.sendEvent(eventName, doc);
+  ++monitorSent;
+  String json;
+  doc["type"] = eventName;
+  serializeJson(doc, json);
+  logWebEvent(json);
+}
+
+static void serviceMonitor() {
+  if (monitorMode == MON_NONE) return;
+
+  if (monitorHop && millis() - monitorLastHop >= monitorHopIntervalMs) {
+    monitorLastHop = millis();
+    monitorChannel = (monitorChannel % 13) + 1;
+    wifi_set_channel(monitorChannel);
+    JsonDocument ev;
+    ev["channel"] = monitorChannel;
+    if (monitorMode == MON_DEAUTH) bridge.sendEvent("deauth_detector_hop", ev);
+    else if (monitorMode == MON_HIDDEN) bridge.sendEvent("hidden_ap_hop", ev);
+  }
+
+  while (pendingTail != pendingHead) {
+    MonitorEvent ev = pendingEvents[pendingTail];
+    pendingTail = (pendingTail + 1) % NR_MAX_PENDING_EVENTS;
+    emitMonitorEvent(ev);
+    yield();
+  }
+
+  if (monitorAutoStopAt && static_cast<int32_t>(millis() - monitorAutoStopAt) >= 0) {
+    stopMonitor(true);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Wi-Fi scan helpers
+// -----------------------------------------------------------------------------
+static const char* encName(uint8_t enc) {
+  switch (enc) {
+#ifdef ENC_TYPE_NONE
+    case ENC_TYPE_NONE: return "OPEN";
+#endif
+#ifdef ENC_TYPE_WEP
+    case ENC_TYPE_WEP: return "WEP";
+#endif
+#ifdef ENC_TYPE_TKIP
+    case ENC_TYPE_TKIP: return "WPA/TKIP";
+#endif
+#ifdef ENC_TYPE_CCMP
+    case ENC_TYPE_CCMP: return "WPA2/CCMP";
+#endif
+#ifdef ENC_TYPE_AUTO
+    case ENC_TYPE_AUTO: return "WPA/WPA2";
+#endif
+    default: return "UNKNOWN";
+  }
+}
+
+static int scanWifiAndEmit() {
+  int n = WiFi.scanNetworks(false, true);
+  if (n < 0) return n;
+  for (int i = 0; i < n; ++i) {
+    JsonDocument ev;
+    ev["ssid"] = WiFi.SSID(i);
+    ev["bssid"] = WiFi.BSSIDstr(i);
+    ev["channel"] = WiFi.channel(i);
+    ev["rssi"] = WiFi.RSSI(i);
+    ev["security"] = encName(WiFi.encryptionType(i));
+    ev["wps"] = false; // ESP8266 Arduino scan API does not expose a WPS flag.
+    bridge.sendEvent("scan_ap", ev);
+    yield();
+  }
+  WiFi.scanDelete();
+  return n;
+}
+
+// -----------------------------------------------------------------------------
+// STATUS document / feature negotiation
+// -----------------------------------------------------------------------------
+static void fillStatus(JsonDocument& doc) {
+  doc["ok"] = true;
+  doc["uptime"] = millis();
+  doc["heap"] = ESP.getFreeHeap();
+  doc["chip"] = "ESP8266";
+  doc["proto"] = NR_PROTO_VERSION;
+  doc["fw"] = NR_FW_VERSION;
+  char dev[16];
+  snprintf(dev, sizeof(dev), "NR%08X", ESP.getChipId());
+  doc["device_id"] = dev;
+
+  JsonArray features = doc["features"].to<JsonArray>();
+  features.add("wifi");
+  features.add("client_detect");
+  features.add("deauth_detect");
+  features.add("hidden_ap");
+  features.add("stop_all");
+  // Custom additive flags; old Android clients safely ignore unknown flags.
+  features.add("web_admin");
+#if NR_HAS_NAPT
+  features.add("repeater");
+#endif
+
+  doc["sniffing"] = false;
+  doc["client_detecting"] = (monitorMode == MON_CLIENT);
+  doc["portal"] = false;
+  doc["beacon"] = false;
+  doc["deauth_detector"] = (monitorMode == MON_DEAUTH);
+  doc["hidden_ap"] = (monitorMode == MON_HIDDEN);
+  doc["ble_scanning"] = false;
+  doc["ble_profiling"] = false;
+  doc["oversized_frames"] = bridge.oversizedFrames();
+  doc["channel"] = monitorMode != MON_NONE ? monitorChannel : WiFi.channel();
+  doc["deauth_detector_channel"] = monitorChannel;
+  doc["deauth_detector_hopping"] = monitorMode == MON_DEAUTH && monitorHop;
+  doc["deauth_detected"] = monitorMode == MON_DEAUTH ? monitorDetected : 0;
+  doc["deauth_detector_sent"] = monitorMode == MON_DEAUTH ? monitorSent : 0;
+  doc["deauth_detector_dropped"] = monitorMode == MON_DEAUTH ? monitorDropped : 0;
+  doc["hidden_ap_channel"] = monitorChannel;
+  doc["hidden_ap_hopping"] = monitorMode == MON_HIDDEN && monitorHop;
+  doc["hidden_ap_seen"] = monitorMode == MON_HIDDEN ? hiddenSeen : 0;
+  doc["hidden_ap_candidates"] = monitorMode == MON_HIDDEN ? hiddenCandidates : 0;
+  doc["hidden_ap_resolved"] = monitorMode == MON_HIDDEN ? hiddenResolved : 0;
+  doc["hidden_ap_sent"] = monitorMode == MON_HIDDEN ? monitorSent : 0;
+  doc["hidden_ap_dropped"] = monitorMode == MON_HIDDEN ? monitorDropped : 0;
+
+  // ESP8266 extension fields for the web UI.
+  doc["network_mode"] = networkModeName();
+  doc["sta_connected"] = WiFi.status() == WL_CONNECTED;
+  doc["sta_ip"] = WiFi.localIP().toString();
+  doc["ap_ip"] = hasApMode() ? WiFi.softAPIP().toString() : String("");
+  doc["ap_clients"] = hasApMode() ? WiFi.softAPgetStationNum() : 0;
+  doc["napt"] = naptEnabled;
+  doc["napt_compiled"] = static_cast<bool>(NR_HAS_NAPT);
+}
+
+// -----------------------------------------------------------------------------
+// Command dispatcher
+// -----------------------------------------------------------------------------
+static bool isAnyOf(const char* cmd, const char* const*
