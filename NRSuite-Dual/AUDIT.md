@@ -30,6 +30,8 @@ Implemented compatible commands:
 - `DEAUTH_DETECT_START`
 - `DEAUTH_DETECT_STOP`
 - `DEAUTH_DETECT_STATUS`
+- `START_CLIENT_DETECT`
+- `STOP_CLIENT_DETECT`
 - `START_HIDDEN_AP`
 - `STOP_HIDDEN_AP`
 
@@ -41,6 +43,8 @@ Implemented compatible events:
 - `deauth_detector_hop`
 - `hidden_ap`
 - `hidden_ap_hop`
+- `client_detected`
+- `client_detector_hop`
 
 ## ESP8266 hardware reconciliation
 
@@ -68,6 +72,9 @@ The NAPT table is deliberately smaller than the upstream core defaults (`128` NA
 - Persistent configuration uses a compact EEPROM struct with magic/version migration guard.
 - STA-only mode falls back to a protected management AP if upstream association fails.
 - Web endpoints use HTTP Basic authentication and the default credentials are documented so they can be changed immediately.
+- Authenticated web OTA uses the ESP8266 core's built-in `ESP8266HTTPUpdateServer`.
+- Reboot/factory recovery and CSV event export are available from the web dashboard.
+- The exact ESP32 upstream commit is pinned as a Git submodule so optimization work is always comparable to a known baseline.
 
 ## Upstream ESP32 audit findings
 
@@ -92,5 +99,6 @@ The sketch was statically reconciled against the current ESP8266 Arduino APIs fo
 - `wifi_set_channel`
 - lwIP `ip_napt_init` / `ip_napt_enable_no`
 - ESP8266WebServer / DNSServer / EEPROM
+- ESP8266HTTPUpdateServer credentialed OTA interface
 
 A local compile could not be run in the ChatGPT execution container because external package download/DNS is disabled there. A GitHub Actions Arduino compile workflow is included in the repository so the checked-in sketch can be compiled on the repository side.
