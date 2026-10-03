@@ -4,6 +4,11 @@ This directory is an optimization overlay for the upstream \`7wp81x/NRSuite-firm
 
 It intentionally does not vendor or extend the upstream active credential-capture, deauthentication-injection, WPA cracking, beacon-spam, or BadUSB payload modules. The goal here is to make the maintainable/safe portions dual-control and more resource-efficient.
 
+## Included code
+
+- `BridgeProtocolOptimized.h/.cpp` — protocol-v1-compatible bridge refactor that reuses the receive JSON document and streams JSON directly to the serial transport after `measureJson()`, removing the upstream per-frame `new/delete` and temporary JSON `String`.
+- The ESP8266 single-file implementation remains the reference for the dual app+web command surface and constrained-memory queueing.
+
 ## Recommended architecture
 
 1. Keep the v1 framed serial protocol as the compatibility layer for the Android app.
