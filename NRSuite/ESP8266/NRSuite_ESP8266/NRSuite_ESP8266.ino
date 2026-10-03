@@ -1122,4 +1122,44 @@ static bool webAuth() {
   return false;
 }
 
-static const char INDEX_HTML[] PROGMEM = 
+static const char INDEX_HTML[] PROGMEM = R"NRHTML(
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NRSuite ESP8266</title><style>
+:root{color-scheme:dark;--bg:#0b1016;--card:#121a23;--line:#263342;--text:#e7edf3;--muted:#93a4b5;--accent:#55c2ff;--good:#72db9a;--warn:#ffcf66;--bad:#ff7676}
+*{box-sizing:border-box}body{margin:0;font:14px system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
+main{max-width:1100px;margin:auto;padding:18px}.top{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}.brand h1{font-size:22px;margin:0}.brand p{color:var(--muted);margin:4px 0 0}.pill{border:1px solid var(--line);padding:7px 10px;border-radius:999px;color:var(--muted)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin-top:14px}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}.card h2{font-size:15px;margin:0 0 10px}.kv{display:grid;grid-template-columns:1fr auto;gap:7px}.kv span:nth-child(odd){color:var(--muted)}
+button,input,select{font:inherit;border-radius:9px;border:1px solid var(--line);background:#0d151e;color:var(--text);padding:9px 10px}button{cursor:pointer}button.primary{background:#16334a;border-color:#2a6287}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.row>*{flex:1;min-width:100px}.tiny{font-size:12px;color:var(--muted)}
+pre{white-space:pre-wrap;word-break:break-word;background:#080d12;border:1px solid var(--line);border-radius:10px;padding:10px;max-height:280px;overflow:auto}.status-good{color:var(--good)}.status-warn{color:var(--warn)}.status-bad{color:var(--bad)}
+label{display:block;color:var(--muted);font-size:12px;margin:8px 0 4px}.wide{width:100%}.danger{border-color:#6a3030}.footer{color:var(--muted);font-size:12px;margin:18px 2px}
+</style></head><body><main>
+<div class="top"><div class="brand"><h1>NRSuite ESP8266</h1><p>Protocol-compatible controller + standalone web management</p></div><div id="chip" class="pill">Loading…</div></div>
+<div class="grid">
+<section class="card"><h2>Device</h2><div id="device" class="kv"></div></section>
+<section class="card"><h2>Network</h2><div id="network" class="kv"></div></section>
+<section class="card"><h2>Wi-Fi scan</h2><p class="tiny">Scans visible 2.4 GHz APs. The access point may pause briefly.</p><button class="primary" onclick="scan()">Scan now</button><pre id="scan">No scan yet.</pre></section>
+<section class="card"><h2>Passive monitor</h2><p class="tiny">ESP8266 monitor mode suspends AP/STA traffic. Browser-started capture automatically stops and restores networking.</p>
+<div class="row"><select id="mon"><option value="deauth">Deauth detector</option><option value="client">Client detector</option><option value="hidden">Hidden AP revealer</option></select><select id="hop"><option value="1">Hop channels</option><option value="0">Fixed channel</option></select><input id="ch" type="number" min="1" max="13" value="1"></div>
+<div class="row" style="margin-top:8px"><input id="dur" type="number" min="5" max="120" value="15" title="Seconds"><button class="primary" onclick="startMon()">Start timed capture</button><button onclick="stopMon()">Stop</button></div>
+<pre id="events">No captured events yet.</pre></section>
+<section class="card"><h2>Network settings</h2><form method="post" action="/api/settings">
+<label>Mode</label><select name="mode" class="wide"><option value="0">AP only</option><option value="1">STA only</option><option value="2">AP + STA</option><option value="3">AP + STA internet repeater (NAPT)</option></select>
+<label>AP SSID</label><input class="wide" name="ap_ssid" placeholder="NRSuite-8266"><label>AP password</label><input class="wide" name="ap_pass" type="password" placeholder="Leave blank to keep current">
+<label>Upstream STA SSID</label><input class="wide" name="sta_ssid"><label>Upstream STA password</label><input class="wide" name="sta_pass" type="password" placeholder="Leave blank to keep current">
+<label>Web user</label><input class="wide" name="web_user"><label>Web password</label><input class="wide" name="web_pass" type="password" placeholder="Leave blank to keep current"><button class="primary" style="margin-top:10px" type="submit">Save & reboot</button></form></section>
+<section class="card"><h2>Maintenance</h2><p class="tiny">Serial app transport stays at 115200 baud. Browser and Android app use the same runtime state.</p><button class="danger" onclick="reboot()">Reboot device</button></section>
+</div><div class="footer">NRSuite ESP8266 compatibility port. Use passive radio analysis only on networks/devices you own or are authorized to test.</div>
+<script>
+const esc=s=>String(s??'').replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]));
+async function status(){try{let r=await fetch('/api/status');let j=await r.json();chip.textContent=j.chip+' · '+j.fw;device.innerHTML=`<span>Device ID</span><b>${esc(j.device_id)}</b><span>Free heap</span><b>${j.heap}</b><span>Monitor</span><b>${j.monitor||'idle'}</b><span>Channel</span><b>${j.channel||'-'}</b>`;network.innerHTML=`<span>Mode</span><b>${esc(j.network_mode)}</b><span>STA</span><b class="${j.sta_connected?'status-good':'status-warn'}">${j.sta_connected?'connected':'offline'}</b><span>STA IP</span><b>${esc(j.sta_ip)}</b><span>AP IP</span><b>${esc(j.ap_ip)}</b><span>AP clients</span><b>${j.ap_clients}</b><span>NAPT</span><b>${j.napt?'on':(j.napt_compiled?'off':'not compiled')}</b>`;}catch(e){chip.textContent='Disconnected / monitor active';}}
+async function scan(){document.getElementById('scan').textContent='Scanning…';try{let r=await fetch('/api/scan',{method:'POST'}),j=await r.json();document.getElementById('scan').textContent=(j.networks||[]).map(x=>`${x.rssi} dBm  ch${x.channel}  ${x.bssid}  ${x.security}  ${x.ssid||'<hidden>'}`).join('\n')||'No networks found.';}catch(e){document.getElementById('scan').textContent='Scan connection interrupted.'}}
+async function startMon(){let q=new URLSearchParams({mode:mon.value,hop:hop.value,channel:ch.value,duration:dur.value});try{await fetch('/api/monitor/start?'+q,{method:'POST'});events.textContent='Capture running. Wi-Fi management network is temporarily suspended; reconnect after the selected duration.';}catch(e){events.textContent='Capture started; connection dropped as expected. Reconnect after the timer expires.'}}
+async function stopMon(){try{await fetch('/api/monitor/stop',{method:'POST'});}catch(e){}setTimeout(()=>location.reload(),1500)}
+async function loadEvents(){try{let r=await fetch('/api/events'),j=await r.json();events.textContent=(j.events||[]).join('\n')||'No captured events yet.';}catch(e){}}
+async function reboot(){if(confirm('Reboot NRSuite ESP8266?')){try{await fetch('/api/reboot',{method:'POST'})}catch(e){} }}
+status();loadEvents();setInterval(status,3000);setInterval(loadEvents,5000);
+</script></main></body></html>
+)NRHTML";
+
+static void redirectRoot() {
+  web.sendHeader("Locati
