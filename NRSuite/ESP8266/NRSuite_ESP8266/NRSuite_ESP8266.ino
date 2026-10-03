@@ -417,7 +417,8 @@ static bool parseSsidIe(const uint8_t* frame, size_t frameLen, size_t offset,
   return false;
 }
 
-static bool queueMonitorEvent(const MonitorEvent& ev) {
+static bool queueMonitorEvent(const void* evtPtr) {
+  const MonitorEvent& ev = *static_cast<const MonitorEvent*>(evtPtr);
   uint8_t next = (pendingHead + 1) % NR_MAX_PENDING_EVENTS;
   if (next == pendingTail) {
     ++monitorDropped;
@@ -457,7 +458,7 @@ static void promiscuousCb(uint8_t* buf, uint16_t len) {
     if (subtype != 0x0C && subtype != 0x0A) return;
     ev.type = EV_DEAUTH;
     if (frameLen >= 26) ev.reason = frame[24] | (static_cast<uint16_t>(frame[25]) << 8);
-    queueMonitorEvent(ev);
+    queueMonitorEvent(&ev);
     return;
   }
 
@@ -468,7 +469,7 @@ static void promiscuousCb(uint8_t* buf, uint16_t len) {
     if (subtype == 0x04) parseSsidIe(frame, frameLen, 24, ev.ssid, sizeof(ev.ssid), &present);
     else if (subtype == 0x00) parseSsidIe(frame, frameLen, 28, ev.ssid, sizeof(ev.ssid), &present);
     else if (subtype == 0x02) parseSsidIe(frame, frameLen, 34, ev.ssid, sizeof(ev.ssid), &present);
-    queueMonitorEvent(ev);
+    queueMonitorEvent(&ev);
     return;
   }
 
@@ -479,7 +480,7 @@ static void promiscuousCb(uint8_t* buf, uint16_t len) {
       bool hasSsid = parseSsidIe(frame, frameLen, 36, ev.ssid, sizeof(ev.ssid), &present);
       if (hasSsid) return;
       ev.type = EV_HIDDEN_AP;
-      queueMonitorEvent(ev);
+      queueMonitorEvent(&ev);
       return;
     }
     if (subtype == 0x04) {
@@ -487,7 +488,7 @@ static void promiscuousCb(uint8_t* buf, uint16_t len) {
       bool hasSsid = parseSsidIe(frame, frameLen, 24, ev.ssid, sizeof(ev.ssid), &present);
       if (!hasSsid || !present) return;
       ev.type = EV_HIDDEN_CANDIDATE;
-      queueMonitorEvent(ev);
+      queueMonitorEvent(&ev);
       return;
     }
     if (subtype == 0x00 || subtype == 0x02) {
@@ -496,7 +497,7 @@ static void promiscuousCb(uint8_t* buf, uint16_t len) {
       bool hasSsid = parseSsidIe(frame, frameLen, off, ev.ssid, sizeof(ev.ssid), &present);
       if (!hasSsid || !present) return;
       ev.type = EV_HIDDEN_RESOLVED;
-      queueMonitorEvent(ev);
+      queueMonitorEvent(&ev);
       return;
     }
   }
@@ -718,7 +719,8 @@ static const char* subtypeName(uint8_t subtype) {
   }
 }
 
-static void emitMonitorEvent(MonitorEvent& ev) {
+static void emitMonitorEvent(void* evtPtr) {
+  MonitorEvent& ev = *static_cast<MonitorEvent*>(evtPtr);
   char a1[18], a2[18], bssid[18];
   macToString(ev.addr1, a1);
   macToString(ev.addr2, a2);
@@ -813,7 +815,7 @@ static void serviceMonitor() {
   while (pendingTail != pendingHead) {
     MonitorEvent ev = pendingEvents[pendingTail];
     pendingTail = (pendingTail + 1) % NR_MAX_PENDING_EVENTS;
-    emitMonitorEvent(ev);
+    emitMonitorEvent(&ev);
     yield();
   }
 
