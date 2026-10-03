@@ -188,3 +188,193 @@ String htmlEscape(const String& in) {
 }
 
 String jsonEscape(const String& in) {
+  String out;
+  out.reserve(in.length() + 8);
+  for (size_t i = 0; i < in.length(); ++i) {
+    char c = in[i];
+    switch (c) {
+      case '\\': out += F("\\\\"); break;
+      case '"': out += F("\\\""); break;
+      case '\n': out += F("\\n"); break;
+      case '\r': out += F("\\r"); break;
+      case '\t': out += F("\\t"); break;
+      default:
+        if ((uint8_t)c >= 0x20) out += c;
+        break;
+    }
+  }
+  return out;
+}
+
+String macString(const uint8_t* m) {
+  char b[18];
+  snprintf(b, sizeof(b), "%02X:%02X:%02X:%02X:%02X:%02X",
+           m[0], m[1], m[2], m[3], m[4], m[5]);
+  return String(b);
+}
+
+const char* netModeName(uint8_t m) {
+  switch (m) {
+    case NET_AP: return "AP";
+    case NET_STA: return "STA";
+    case NET_APSTA: return "AP+STA";
+    case NET_REPEATER: return "REPEATER";
+    default: return "AP";
+  }
+}
+
+String encName(uint8_t enc) {
+  switch (enc) {
+    case ENC_TYPE_NONE: return F("OPEN");
+    case ENC_TYPE_WEP: return F("WEP");
+    case ENC_TYPE_TKIP: return F("WPA/TKIP");
+    case ENC_TYPE_CCMP: return F("WPA2/CCMP");
+#ifdef ENC_TYPE_AUTO
+    case ENC_TYPE_AUTO: return F("WPA/WPA2");
+#endif
+    default: return F("UNKNOWN");
+  }
+}
+
+void addEventLog(const String& line) {
+  eventLog[eventLogHead].ms = millis();
+  eventLog[eventLogHead].text = line;
+  eventLogHead = (eventLogHead + 1) % NR_EVENT_LOG_SIZE;
+}
+
+void setDefaultConfig() {
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.magic = NR_CFG_MAGIC;
+  cfg.version = NR_CFG_VERSION;
+  cfg.netMode = NET_AP;
+  cfg.apChannel = 1;
+  snprintf(cfg.apSsid, sizeof(cfg.apSsid), "NRSuite-%06X", ESP.getChipId() & 0xFFFFFF);
+  strlcpy(cfg.apPass, "nrsuite8266", sizeof(cfg.apPass));
+  strlcpy(cfg.adminUser, "admin", sizeof(cfg.adminUser));
+  strlcpy(cfg.adminPass, "nrsuite8266", sizeof(cfg.adminPass));
+}
+
+void saveConfig() {
+  cfg.magic = NR_CFG_MAGIC;
+  cfg.version = NR_CFG_VERSION;
+  EEPROM.put(0, cfg);
+  EEPROM.commit();
+}
+
+void loadConfig() {
+  EEPROM.begin(NR_EEPROM_SIZE);
+  EEPROM.get(0, cfg);
+  if (cfg.magic != NR_CFG_MAGIC || cfg.version != NR_CFG_VERSION || cfg.netMode > NET_REPEATER) {
+    setDefaultConfig();
+    saveConfig();
+  }
+  cfg.staSsid[32] = 0;
+  cfg.staPass[64] = 0;
+  cfg.apSsid[32] = 0;
+  cfg.apPass[64] = 0;
+  cfg.adminUser[16] = 0;
+  cfg.adminPass[32] = 0;
+  if (strlen(cfg.apSsid) == 0) snprintf(cfg.apSsid, sizeof(cfg.apSsid), "NRSuite-%06X", ESP.getChipId() & 0xFFFFFF);
+  if (strlen(cfg.apPass) < 8) strlcpy(cfg.apPass, "nrsuite8266", sizeof(cfg.apPass));
+  if (strlen(cfg.adminUser) == 0) strlcpy(cfg.adminUser, "admin", sizeof(cfg.adminUser));
+  if (strlen(cfg.adminPass) < 8) strlcpy(cfg.adminPass, "nrsuite8266", sizeof(cfg.adminPass));
+}
+
+bool authOk() {
+  if (server.authenticate(cfg.adminUser, cfg.adminPass)) return true;
+  server.requestAuthentication(BASIC_AUTH, "NRSuite ESP8266");
+  return false;
+}
+
+// -----------------------------------------------------------------------------
+// Tiny JSON readers for protocol commands (avoids ArduinoJson RAM/flash cost)
+// Handles the simple command payloads emitted by the Android app.
+// -----------------------------------------------------------------------------
+int jsonFindKey(const String& s, const char* key) {
+  String pattern = String('"') + key + F("\"");
+  return s.indexOf(pattern);
+}
+
+String jsonStringValue(const String& s, const char* key, const String& def = "") {
+  int p = jsonFindKey(s, key);
+  if (p < 0) return def;
+  p = s.indexOf(':', p);
+  if (p < 0) return def;
+  p++;
+  while (p < (int)s.length() && isspace((unsigned char)s[p])) p++;
+  if (p >= (int)s.length() || s[p] != '"') return def;
+  p++;
+  String out;
+  while (p < (int)s.length()) {
+    char c = s[p++];
+    if (c == '"') break;
+    if (c == '\\' && p < (int)s.length()) {
+      char e = s[p++];
+      if (e == 'n') out += '\n';
+      else if (e == 'r') out += '\r';
+      else if (e == 't') out += '\t';
+      else out += e;
+    } else out += c;
+  }
+  return out;
+}
+
+long jsonIntValue(const String& s, const char* key, long def) {
+  int p = jsonFindKey(s, key);
+  if (p < 0) return def;
+  p = s.indexOf(':', p);
+  if (p < 0) return def;
+  p++;
+  while (p < (int)s.length() && isspace((unsigned char)s[p])) p++;
+  bool neg = false;
+  if (p < (int)s.length() && s[p] == '-') { neg = true; p++; }
+  long v = 0;
+  bool any = false;
+  while (p < (int)s.length() && isdigit((unsigned char)s[p])) {
+    any = true;
+    v = v * 10 + (s[p++] - '0');
+  }
+  return any ? (neg ? -v : v) : def;
+}
+
+bool jsonBoolValue(const String& s, const char* key, bool def) {
+  int p = jsonFindKey(s, key);
+  if (p < 0) return def;
+  p = s.indexOf(':', p);
+  if (p < 0) return def;
+  p++;
+  while (p < (int)s.length() && isspace((unsigned char)s[p])) p++;
+  if (s.substring(p, p + 4) == "true") return true;
+  if (s.substring(p, p + 5) == "false") return false;
+  return def;
+}
+
+// -----------------------------------------------------------------------------
+// NRSuite serial framing
+// -----------------------------------------------------------------------------
+void sendRawFrame(uint8_t type, uint8_t id, const uint8_t* payload, uint32_t len) {
+  if (len > NR_PROTO_MAX) return;
+  uint8_t h[NR_PROTO_HEADER];
+  h[0] = NR_PROTO_MAGIC0;
+  h[1] = NR_PROTO_MAGIC1;
+  h[2] = type;
+  h[3] = id;
+  h[4] = (uint8_t)(len & 0xFF);
+  h[5] = (uint8_t)((len >> 8) & 0xFF);
+  h[6] = (uint8_t)((len >> 16) & 0xFF);
+  h[7] = (uint8_t)((len >> 24) & 0xFF);
+  Serial.write(h, sizeof(h));
+  if (len && payload) Serial.write(payload, len);
+}
+
+void sendJsonFrame(uint8_t type, uint8_t id, const String& json) {
+  sendRawFrame(type, id, (const uint8_t*)json.c_str(), json.length());
+}
+
+void sendResponse(uint8_t id, bool ok, const String& extra = "", const String& msg = "") {
+  String j = String(F("{\"ok\":")) + (ok ? F("true") : F("false"));
+  if (msg.length()) j += String(F(",\"msg\":\"")) + jsonEscape(msg) + '"';
+  if (extra.length()) {
+    if (extra[0] != ',') j += ',';
+    j += extra;
+  }
