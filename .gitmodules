@@ -1,0 +1,4 @@
+[submodule "NRSuite-Dual/ESP32-Upstream"]
+	path = NRSuite-Dual/ESP32-Upstream
+	url = https://github.com/7wp81x/NRSuite-firmware.git
+	branch = main
