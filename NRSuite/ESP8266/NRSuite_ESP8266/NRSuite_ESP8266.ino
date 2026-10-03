@@ -1162,4 +1162,180 @@ status();loadEvents();setInterval(status,3000);setInterval(loadEvents,5000);
 )NRHTML";
 
 static void redirectRoot() {
-  web.sendHeader("Locati
+  web.sendHeader("Location", String("http://") + (hasApMode() ? WiFi.softAPIP().toString() : WiFi.localIP().toString()), true);
+  web.send(302, "text/plain", "");
+}
+
+static void handleStatusApi() {
+  if (!webAuth()) return;
+  JsonDocument doc;
+  fillStatus(doc);
+  if (monitorMode == MON_CLIENT) doc["monitor"] = "client";
+  else if (monitorMode == MON_DEAUTH) doc["monitor"] = "deauth";
+  else if (monitorMode == MON_HIDDEN) doc["monitor"] = "hidden";
+  else doc["monitor"] = "idle";
+  String out;
+  serializeJson(doc, out);
+  web.send(200, "application/json", out);
+}
+
+static void handleScanApi() {
+  if (!webAuth()) return;
+  if (monitorMode != MON_NONE) {
+    web.send(409, "application/json", "{\"ok\":false,\"msg\":\"stop monitor first\"}");
+    return;
+  }
+  int n = WiFi.scanNetworks(false, true);
+  JsonDocument doc;
+  doc["ok"] = n >= 0;
+  JsonArray arr = doc["networks"].to<JsonArray>();
+  if (n > 0) {
+    for (int i = 0; i < n; ++i) {
+      JsonObject o = arr.add<JsonObject>();
+      o["ssid"] = WiFi.SSID(i);
+      o["bssid"] = WiFi.BSSIDstr(i);
+      o["channel"] = WiFi.channel(i);
+      o["rssi"] = WiFi.RSSI(i);
+      o["security"] = encName(WiFi.encryptionType(i));
+    }
+  }
+  WiFi.scanDelete();
+  String out;
+  serializeJson(doc, out);
+  web.send(n >= 0 ? 200 : 500, "application/json", out);
+}
+
+static void handleMonitorStartApi() {
+  if (!webAuth()) return;
+  String mode = web.arg("mode");
+  bool hop = web.arg("hop") != "0";
+  int channel = web.arg("channel").toInt();
+  int duration = web.arg("duration").toInt();
+  duration = constrain(duration, 5, 120);
+  MonitorMode mm = MON_DEAUTH;
+  if (mode == "client") mm = MON_CLIENT;
+  else if (mode == "hidden") mm = MON_HIDDEN;
+
+  pendingWebMonitorMode = mm;
+  pendingWebMonitorChannel = constrain(channel, 1, 13);
+  pendingWebMonitorHop = hop;
+  pendingWebMonitorDurationMs = static_cast<uint32_t>(duration) * 1000UL;
+  pendingWebMonitorStartAt = millis() + 250;
+  pendingWebMonitorStart = true;
+  web.send(202, "application/json", "{\"ok\":true,\"state\":\"starting\"}");
+}
+
+static void servicePendingWebMonitorStart() {
+  if (!pendingWebMonitorStart) return;
+  if (static_cast<int32_t>(millis() - pendingWebMonitorStartAt) < 0) return;
+  pendingWebMonitorStart = false;
+  deauthFilterHasBssid = false;
+  deauthFilterHasClient = false;
+  startMonitor(pendingWebMonitorMode, pendingWebMonitorChannel, pendingWebMonitorHop,
+               300, -100, pendingWebMonitorDurationMs);
+}
+
+static void handleMonitorStopApi() {
+  if (!webAuth()) return;
+  stopMonitor(true);
+  web.send(200, "application/json", "{\"ok\":true}");
+}
+
+static void handleEventsApi() {
+  if (!webAuth()) return;
+  JsonDocument doc;
+  doc["ok"] = true;
+  JsonArray arr = doc["events"].to<JsonArray>();
+  uint8_t start = (webEventHead + NR_MAX_WEB_EVENTS - webEventCount) % NR_MAX_WEB_EVENTS;
+  for (uint8_t i = 0; i < webEventCount; ++i) {
+    arr.add(webEvents[(start + i) % NR_MAX_WEB_EVENTS]);
+  }
+  String out;
+  serializeJson(doc, out);
+  web.send(200, "application/json", out);
+}
+
+static void handleSettingsApi() {
+  if (!webAuth()) return;
+  int mode = web.arg("mode").toInt();
+  if (mode < NET_AP_ONLY || mode > NET_REPEATER) mode = NET_AP_ONLY;
+  cfg.networkMode = mode;
+
+  String s;
+  s = web.arg("ap_ssid"); if (s.length()) strlcpy(cfg.apSsid, s.c_str(), sizeof(cfg.apSsid));
+  s = web.arg("ap_pass"); if (s.length()) strlcpy(cfg.apPass, s.c_str(), sizeof(cfg.apPass));
+  s = web.arg("sta_ssid"); strlcpy(cfg.staSsid, s.c_str(), sizeof(cfg.staSsid));
+  s = web.arg("sta_pass"); if (s.length()) strlcpy(cfg.staPass, s.c_str(), sizeof(cfg.staPass));
+  s = web.arg("web_user"); if (s.length()) strlcpy(cfg.webUser, s.c_str(), sizeof(cfg.webUser));
+  s = web.arg("web_pass"); if (s.length()) strlcpy(cfg.webPass, s.c_str(), sizeof(cfg.webPass));
+
+  if (strlen(cfg.apPass) > 0 && strlen(cfg.apPass) < 8) {
+    web.send(400, "text/plain", "AP password must be empty/open or at least 8 characters.");
+    return;
+  }
+  saveConfig();
+  web.send(200, "text/html", "<meta name=viewport content='width=device-width'><body style='font-family:system-ui;background:#0b1016;color:#e7edf3;padding:24px'><h2>Saved</h2><p>Rebooting with the new network configuration…</p></body>");
+  delay(250);
+  ESP.restart();
+}
+
+static void startWebIfNeeded() {
+  if (webStarted) return;
+  web.on("/", HTTP_GET, []() {
+    if (!webAuth()) return;
+    web.send_P(200, "text/html", INDEX_HTML);
+  });
+  web.on("/api/status", HTTP_GET, handleStatusApi);
+  web.on("/api/scan", HTTP_POST, handleScanApi);
+  web.on("/api/monitor/start", HTTP_POST, handleMonitorStartApi);
+  web.on("/api/monitor/stop", HTTP_POST, handleMonitorStopApi);
+  web.on("/api/events", HTTP_GET, handleEventsApi);
+  web.on("/api/settings", HTTP_POST, handleSettingsApi);
+  web.on("/api/reboot", HTTP_POST, []() {
+    if (!webAuth()) return;
+    web.send(200, "application/json", "{\"ok\":true}");
+    delay(150);
+    ESP.restart();
+  });
+
+  // Common captive-network probes route to the local controller.
+  web.on("/generate_204", HTTP_ANY, redirectRoot);
+  web.on("/gen_204", HTTP_ANY, redirectRoot);
+  web.on("/hotspot-detect.html", HTTP_ANY, redirectRoot);
+  web.on("/ncsi.txt", HTTP_ANY, redirectRoot);
+  web.onNotFound(redirectRoot);
+  web.begin();
+  webStarted = true;
+}
+
+// -----------------------------------------------------------------------------
+// Arduino entry points
+// -----------------------------------------------------------------------------
+void setup() {
+  // Never print human-readable debug output to Serial: this port intentionally
+  // keeps the byte stream clean for the NRSuite binary protocol.
+  Serial.begin(115200);
+  Serial.setDebugOutput(false);
+  delay(20);
+
+  loadConfig();
+  bridge.begin(Serial, handleCommand);
+  applyNetworkConfig();
+}
+
+void loop() {
+  bridge.update();
+  servicePendingWebMonitorStart();
+  serviceMonitor();
+
+  if (monitorMode == MON_NONE) {
+    if (dnsStarted) dns.processNextRequest();
+    if (webStarted) web.handleClient();
+    if (millis() - lastNetworkService >= 1000) {
+      lastNetworkService = millis();
+      serviceNapt();
+    }
+  }
+
+  yield();
+}
