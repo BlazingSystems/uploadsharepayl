@@ -48,6 +48,6 @@
 - [x] Document hardware-impossible BLE/native-USB parity and radio scheduling constraint.
 
 ### Task 5: Compile CI and final audit
-- [ ] Compile against ESP8266 core 3.1.2 and ArduinoJson 7.4.3.
-- [ ] Fix all compile failures without weakening protocol behavior.
-- [ ] Inspect final diff before merge.
+- [x] Compile against ESP8266 core 3.1.2 and ArduinoJson 7.4.3.
+- [x] Fix all compile failures without weakening protocol behavior.
+- [x] Inspect final diff before merge.
