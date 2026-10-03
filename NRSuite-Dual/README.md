@@ -21,7 +21,7 @@ Default web credentials: \`admin\` / \`nrsuite8266\`
 
 Open \`http://192.168.4.1/\` while connected to the setup AP.
 
-The network page supports AP, STA with fallback AP, AP+STA, and AP+STA Internet Repeater (NAPT). Because ESP8266 has one 2.4 GHz radio, channel-hopping passive monitoring temporarily conflicts with a stable STA/repeater link; the firmware handles that as an explicit radio mode instead of pretending both can run independently.
+The network page supports AP, STA with fallback AP, AP+STA, and AP+STA Internet Repeater (NAPT). It also includes Wi-Fi scanning, passive client/deauth/hidden-AP telemetry, recent-event export, authenticated web firmware update, reboot, and factory recovery. Because ESP8266 has one 2.4 GHz radio, channel-hopping passive monitoring temporarily conflicts with a stable STA/repeater link; the firmware handles that as an explicit radio mode instead of pretending both can run independently.
 
 ## Android app compatibility
 
@@ -30,3 +30,7 @@ The ESP8266 firmware preserves NRSuite protocol v1 framing and the \`PING\` / \`
 ## Scope
 
 This fork focuses on device management, scanning, passive detection, telemetry, web control, and network/repeater operation. Active deauthentication injection, credential-capture portals, WPA cracking, beacon spam, and BadUSB payload execution are intentionally not reproduced in this port.
+
+## ESP32 upstream snapshot
+
+The original ESP32 firmware is pinned as a submodule at `ESP32-Upstream/` to upstream commit `0566adf0eaa1ed133c97c308c1ae17409cd0d59c`. Clone with `git clone --recurse-submodules` (or run `git submodule update --init --recursive`) to materialize it locally. The optimization notes beside it document the dual-control/refactor path without silently changing the pinned upstream baseline.
