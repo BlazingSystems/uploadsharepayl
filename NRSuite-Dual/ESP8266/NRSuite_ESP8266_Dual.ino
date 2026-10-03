@@ -35,6 +35,7 @@
 #include <ESP8266WebServer.h>
 #include <DNSServer.h>
 #include <EEPROM.h>
+#include <ESP8266HTTPUpdateServer.h>
 
 extern "C" {
 #include <user_interface.h>
@@ -89,7 +90,8 @@ enum NetMode : uint8_t {
 enum MonitorMode : uint8_t {
   MON_NONE = 0,
   MON_DEAUTH = 1,
-  MON_HIDDEN = 2
+  MON_HIDDEN = 2,
+  MON_CLIENT = 3
 };
 
 struct Config {
@@ -125,6 +127,7 @@ struct EventLine {
 Config cfg;
 ESP8266WebServer server(80);
 DNSServer dnsServer;
+ESP8266HTTPUpdateServer httpUpdater(false);
 
 static uint8_t protoRx[NR_RX_CAP];
 static uint16_t protoRxLen = 0;
@@ -154,6 +157,8 @@ static uint32_t deauthDetected = 0;
 static volatile uint32_t deauthDropped = 0;
 static uint32_t hiddenSeen = 0;
 static volatile uint32_t hiddenDropped = 0;
+static uint32_t clientSeen = 0;
+static volatile uint32_t clientDropped = 0;
 
 static EventLine eventLog[NR_EVENT_LOG_SIZE];
 static uint8_t eventLogHead = 0;
@@ -585,7 +590,8 @@ void ICACHE_RAM_ATTR queueMonitorEvent(const MonitorEvent& e) {
   uint8_t next = (uint8_t)((monHead + 1) % NR_MON_QUEUE_SIZE);
   if (next == monTail) {
     if (e.kind <= 2) deauthDropped++;
-    else hiddenDropped++;
+    else if (e.kind == 3) hiddenDropped++;
+    else clientDropped++;
     return;
   }
   memcpy((void*)&monQueue[monHead], &e, sizeof(e));
@@ -612,6 +618,21 @@ void ICACHE_RAM_ATTR promiscCb(uint8_t* buff, uint16_t len) {
     memcpy(e.src, p + 10, 6);
     memcpy(e.bssid, p + 16, 6);
     if (plen >= 26) e.reason = (uint16_t)p[24] | ((uint16_t)p[25] << 8);
+    queueMonitorEvent(e);
+    return;
+  }
+
+  if (monitorMode == MON_CLIENT) {
+    if (subtype != 0x04 && subtype != 0x00 && subtype != 0x02 && subtype != 0x0B) return;
+    MonitorEvent e{};
+    e.kind = 4;
+    e.rssi = (int8_t)buff[0];
+    e.channel = monitorChannel;
+    e.uptime = millis();
+    e.reason = subtype; // reuse field for management subtype
+    memcpy(e.dst, p + 4, 6);
+    memcpy(e.src, p + 10, 6);
+    memcpy(e.bssid, p + 16, 6);
     queueMonitorEvent(e);
     return;
   }
@@ -686,7 +707,8 @@ bool startMonitor(MonitorMode mode, uint8_t channel, bool hop, uint16_t hopMs, b
   monitorStartedFromWeb = fromWeb;
   monitorActive = true;
   wifi_promiscuous_enable(1);
-  addEventLog(String(F("Passive monitor started: ")) + (mode == MON_DEAUTH ? F("deauth") : F("hidden AP")));
+  const __FlashStringHelper* modeName = mode == MON_DEAUTH ? F("deauth") : (mode == MON_HIDDEN ? F("hidden AP") : F("client presence"));
+  addEventLog(String(F("Passive monitor started: ")) + modeName);
   return true;
 }
 
@@ -711,7 +733,8 @@ void processMonitorEvents() {
     monitorChannel = c;
     wifi_promiscuous_enable(1);
     if (monitorMode == MON_DEAUTH) sendEvent("deauth_detector_hop", String(F("\"channel\":")) + c);
-    else sendEvent("hidden_ap_hop", String(F("\"channel\":")) + c);
+    else if (monitorMode == MON_HIDDEN) sendEvent("hidden_ap_hop", String(F("\"channel\":")) + c);
+    else sendEvent("client_detector_hop", String(F("\"channel\":")) + c);
   }
 
   // Web-triggered hopping auto-stops so the browser cannot strand the user indefinitely.
@@ -750,6 +773,17 @@ void processMonitorEvents() {
         F(",\"uptime_ms\":") + String(e.uptime);
       sendEvent("hidden_ap", fields);
       addEventLog(String(F("Hidden AP ch")) + e.channel + F(" ") + macString(e.bssid));
+    } else if (e.kind == 4) {
+      clientSeen++;
+      const char* st = e.reason == 0x04 ? "probe" : (e.reason == 0x00 ? "assoc" : (e.reason == 0x02 ? "reassoc" : "auth"));
+      String fields = String(F("\"client\":\"")) + macString(e.src) +
+        F("\",\"bssid\":\"") + macString(e.bssid) +
+        F("\",\"subtype\":\"") + st +
+        F("\",\"rssi\":") + String(e.rssi) +
+        F(",\"channel\":") + String(e.channel) +
+        F(",\"uptime_ms\":") + String(e.uptime);
+      sendEvent("client_detected", fields);
+      addEventLog(String(F("Client ")) + st + F(" ch") + e.channel + F(" ") + macString(e.src));
     }
     yield();
   }
@@ -805,7 +839,7 @@ String scanJson(bool emitProtocolEvents, int* outCount = nullptr) {
 // Status / command bridge
 // -----------------------------------------------------------------------------
 String statusJson() {
-  String features = F("[\"wifi\",\"deauth_detect\",\"hidden_ap\",\"stop_all\",\"webui\",\"repeater\"]");
+  String features = F("[\"wifi\",\"client_detect\",\"deauth_detect\",\"hidden_ap\",\"stop_all\",\"webui\",\"repeater\",\"web_ota\"]");
   String j = F("{\"ok\":true");
   j += F(",\"uptime\":") + String(millis());
   j += F(",\"heap\":") + String(ESP.getFreeHeap());
@@ -814,7 +848,7 @@ String statusJson() {
   j += F(",\"fw\":\"") + String(NR_FW_VERSION) + '"';
   j += F(",\"device_id\":\"") + chipIdString() + '"';
   j += F(",\"features\":") + features;
-  j += F(",\"sniffing\":false,\"client_detecting\":false,\"portal\":false,\"beacon\":false");
+  j += F(",\"sniffing\":false,\"client_detecting\":") + String((monitorActive && monitorMode == MON_CLIENT) ? F("true") : F("false")) + F(",\"portal\":false,\"beacon\":false");
   j += F(",\"deauth_detector\":") + String((monitorActive && monitorMode == MON_DEAUTH) ? F("true") : F("false"));
   j += F(",\"hidden_ap\":") + String((monitorActive && monitorMode == MON_HIDDEN) ? F("true") : F("false"));
   j += F(",\"ble_scanning\":false,\"ble_profiling\":false");
@@ -827,6 +861,8 @@ String statusJson() {
   j += F(",\"hidden_ap_hopping\":") + String(monitorHop ? F("true") : F("false"));
   j += F(",\"hidden_ap_seen\":") + String(hiddenSeen);
   j += F(",\"hidden_ap_dropped\":") + String(hiddenDropped);
+  j += F(",\"client_detected\":") + String(clientSeen);
+  j += F(",\"client_detector_dropped\":") + String(clientDropped);
   j += F(",\"network_mode\":\"") + String(netModeName(cfg.netMode)) + '"';
   j += F(",\"sta_connected\":") + String(WiFi.status() == WL_CONNECTED ? F("true") : F("false"));
   j += F(",\"sta_ip\":\"") + WiFi.localIP().toString() + '"';
