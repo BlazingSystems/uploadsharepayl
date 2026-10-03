@@ -928,3 +928,179 @@ void handleProtocolCommand(uint8_t id, const String& payload) {
     return;
   }
 
+  sendResponse(id, false, "", F("unknown command"));
+}
+
+// -----------------------------------------------------------------------------
+// Web UI
+// -----------------------------------------------------------------------------
+const char INDEX_HTML[] PROGMEM = R"HTML(
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NRSuite ESP8266</title><style>
+:root{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color-scheme:dark;background:#0e1116;color:#e8edf3}*{box-sizing:border-box}
+body{margin:0;max-width:980px;padding:18px;margin:auto}.top{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+h1{font-size:1.35rem;margin:0}.tag{font-size:.8rem;padding:5px 9px;border:1px solid #334155;border-radius:999px;color:#b8c4d6}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-top:14px}.card{background:#151a22;border:1px solid #29303d;border-radius:14px;padding:14px}
+h2{font-size:1rem;margin:0 0 10px}label{display:block;font-size:.8rem;color:#aab5c4;margin:8px 0 4px}input,select,button{width:100%;padding:10px;border-radius:9px;border:1px solid #364152;background:#0f141b;color:#eef2f7}
+button{cursor:pointer;background:#263244;font-weight:650;margin-top:8px}button:hover{background:#324157}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.muted{color:#9aa6b5;font-size:.82rem}.ok{color:#87d37c}.warn{color:#f6c177}pre{white-space:pre-wrap;word-break:break-word;background:#0b0f14;padding:10px;border-radius:9px;max-height:330px;overflow:auto;font-size:.78rem}
+table{width:100%;border-collapse:collapse;font-size:.76rem}th,td{text-align:left;border-bottom:1px solid #29303d;padding:6px}.wide{grid-column:1/-1}
+</style></head><body>
+<div class="top"><h1>NRSuite ESP8266 Dual</h1><span class="tag">App serial + Web UI</span></div>
+<p class="muted">Defensive port: Wi-Fi scan, passive deauth detection, hidden-AP observation, and AP/STA/NAPT management. Active attack modules are disabled.</p>
+<div class="grid">
+<section class="card"><h2>Status</h2><pre id="status">Loading…</pre><button onclick="loadStatus()">Refresh</button></section>
+<section class="card"><h2>Network mode</h2><form id="wifi" onsubmit="saveWifi(event)"><label>Mode</label><select name="mode"><option value="0">AP only</option><option value="1">STA only (+fallback AP)</option><option value="2">AP + STA</option><option value="3">AP + STA Internet Repeater (NAPT)</option></select><label>Upstream SSID</label><input name="sta_ssid" maxlength="32"><label>Upstream password</label><input name="sta_pass" type="password" maxlength="64"><label>Management AP SSID</label><input name="ap_ssid" maxlength="32"><label>Management AP password (8+)</label><input name="ap_pass" type="password" maxlength="64"><div class="row"><div><label>AP channel</label><input name="channel" type="number" min="1" max="13"></div><div><label>Admin user</label><input name="admin_user" maxlength="16"></div></div><label>Admin password (8+)</label><input name="admin_pass" type="password" maxlength="32"><button>Save & apply</button></form><p class="muted">Changing credentials can disconnect this browser.</p></section>
+<section class="card wide"><h2>Wi-Fi scan</h2><button onclick="scanWifi()">Scan nearby APs</button><div id="scan" class="muted">No scan yet.</div></section>
+<section class="card"><h2>Passive defense</h2><div class="row"><button onclick="monitor('deauth')">Deauth detector</button><button onclick="monitor('hidden')">Hidden AP</button></div><button onclick="monitor('stop')">Stop monitor</button><p class="muted">Fixed-channel monitoring stays compatible with the web link. Channel hopping is available through the Android serial protocol because ESP8266 has one 2.4 GHz radio.</p></section>
+<section class="card"><h2>Recent alerts</h2><pre id="events">Loading…</pre><button onclick="loadEvents()">Refresh</button></section>
+</div>
+<script>
+async function j(u,o){let r=await fetch(u,o);let t=await r.text();try{return JSON.parse(t)}catch(e){return {ok:false,msg:t}}}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+async function loadStatus(){let x=await j('/api/status');document.querySelector('#status').textContent=JSON.stringify(x,null,2);let f=document.querySelector('#wifi');if(x.config){f.mode.value=x.config.mode;f.sta_ssid.value=x.config.sta_ssid;f.ap_ssid.value=x.config.ap_ssid;f.channel.value=x.config.channel;f.admin_user.value=x.config.admin_user}}
+async function saveWifi(e){e.preventDefault();let b=new URLSearchParams(new FormData(e.target));let x=await j('/api/wifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});alert(x.msg||JSON.stringify(x));setTimeout(()=>location.reload(),1800)}
+async function scanWifi(){let d=document.querySelector('#scan');d.textContent='Scanning…';let x=await j('/api/scan');if(!x.ok){d.textContent=x.msg||'Scan failed';return}let h='<table><tr><th>SSID</th><th>RSSI</th><th>Ch</th><th>Security</th><th>BSSID</th></tr>';for(let n of x.networks)h+='<tr><td>'+esc(n.ssid||'(hidden)')+'</td><td>'+n.rssi+'</td><td>'+n.channel+'</td><td>'+esc(n.security)+'</td><td>'+esc(n.bssid)+'</td></tr>';d.innerHTML=h+'</table>'}
+async function monitor(k){let b=new URLSearchParams({kind:k});let x=await j('/api/monitor',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});alert(x.msg||JSON.stringify(x));loadStatus();loadEvents()}
+async function loadEvents(){let x=await j('/api/events');document.querySelector('#events').textContent=(x.events||[]).map(e=>'['+(e.ms/1000).toFixed(1)+'s] '+e.text).join('\n')||'No alerts.'}
+loadStatus();loadEvents();setInterval(()=>{loadStatus();loadEvents()},5000)
+</script></body></html>
+)HTML";
+
+String configJson() {
+  String j = F("{\"mode\":");
+  j += String(cfg.netMode);
+  j += F(",\"sta_ssid\":\"") + jsonEscape(cfg.staSsid) + '"';
+  j += F(",\"ap_ssid\":\"") + jsonEscape(cfg.apSsid) + '"';
+  j += F(",\"channel\":") + String(cfg.apChannel);
+  j += F(",\"admin_user\":\"") + jsonEscape(cfg.adminUser) + F("\"}");
+  return j;
+}
+
+void setupWeb() {
+  if (webStarted) return;
+  webStarted = true;
+
+  server.on("/", HTTP_GET, []() {
+    if (!authOk()) return;
+    server.send_P(200, PSTR("text/html; charset=utf-8"), INDEX_HTML);
+  });
+
+  server.on("/api/status", HTTP_GET, []() {
+    if (!authOk()) return;
+    String j = statusJson();
+    j.remove(j.length() - 1);
+    j += F(",\"config\":") + configJson() + '}';
+    server.send(200, "application/json", j);
+  });
+
+  server.on("/api/events", HTTP_GET, []() {
+    if (!authOk()) return;
+    String j = F("{\"ok\":true,\"events\":[");
+    bool first = true;
+    for (uint8_t i = 0; i < NR_EVENT_LOG_SIZE; ++i) {
+      uint8_t idx = (eventLogHead + i) % NR_EVENT_LOG_SIZE;
+      if (!eventLog[idx].text.length()) continue;
+      if (!first) j += ',';
+      first = false;
+      j += String(F("{\"ms\":")) + eventLog[idx].ms + F(",\"text\":\"") + jsonEscape(eventLog[idx].text) + F("\"}");
+    }
+    j += F("]}");
+    server.send(200, "application/json", j);
+  });
+
+  server.on("/api/scan", HTTP_GET, []() {
+    if (!authOk()) return;
+    int count = 0;
+    String j = scanJson(false, &count);
+    server.send(count < 0 ? 409 : 200, "application/json", j);
+  });
+
+  server.on("/api/monitor", HTTP_POST, []() {
+    if (!authOk()) return;
+    String kind = server.arg("kind");
+    if (kind == "stop") {
+      stopMonitor(true);
+      server.send(200, "application/json", F("{\"ok\":true,\"msg\":\"monitor stopped\"}"));
+      return;
+    }
+    uint8_t ch = wifi_get_channel();
+    if (ch < 1 || ch > 13) ch = cfg.apChannel;
+    if (kind == "deauth") {
+      startMonitor(MON_DEAUTH, ch, false, NR_MON_DEFAULT_MS, true);
+      server.send(200, "application/json", F("{\"ok\":true,\"msg\":\"passive deauth detector started\"}"));
+    } else if (kind == "hidden") {
+      startMonitor(MON_HIDDEN, ch, false, NR_MON_DEFAULT_MS, true);
+      server.send(200, "application/json", F("{\"ok\":true,\"msg\":\"passive hidden-AP observer started\"}"));
+    } else {
+      server.send(400, "application/json", F("{\"ok\":false,\"msg\":\"unknown monitor kind\"}"));
+    }
+  });
+
+  server.on("/api/wifi", HTTP_POST, []() {
+    if (!authOk()) return;
+    int mode = server.arg("mode").toInt();
+    if (mode < 0 || mode > 3) mode = NET_AP;
+    String staSsid = server.arg("sta_ssid");
+    String staPass = server.arg("sta_pass");
+    String apSsid = server.arg("ap_ssid");
+    String apPass = server.arg("ap_pass");
+    String adminUser = server.arg("admin_user");
+    String adminPass = server.arg("admin_pass");
+    int ch = server.arg("channel").toInt();
+    if (apSsid.length() == 0 || apSsid.length() > 32 || apPass.length() < 8 || adminUser.length() == 0 || adminPass.length() < 8 || ch < 1 || ch > 13) {
+      server.send(400, "application/json", F("{\"ok\":false,\"msg\":\"invalid AP/admin fields or channel\"}"));
+      return;
+    }
+    cfg.netMode = mode;
+    cfg.apChannel = ch;
+    strlcpy(cfg.staSsid, staSsid.c_str(), sizeof(cfg.staSsid));
+    if (staPass.length()) strlcpy(cfg.staPass, staPass.c_str(), sizeof(cfg.staPass));
+    strlcpy(cfg.apSsid, apSsid.c_str(), sizeof(cfg.apSsid));
+    if (apPass.length()) strlcpy(cfg.apPass, apPass.c_str(), sizeof(cfg.apPass));
+    strlcpy(cfg.adminUser, adminUser.c_str(), sizeof(cfg.adminUser));
+    if (adminPass.length()) strlcpy(cfg.adminPass, adminPass.c_str(), sizeof(cfg.adminPass));
+    saveConfig();
+    server.send(200, "application/json", F("{\"ok\":true,\"msg\":\"saved; applying network settings\"}"));
+    delay(100);
+    stopMonitor(false);
+    applyNetworkConfig();
+  });
+
+  server.onNotFound([]() {
+    if (!authOk()) return;
+    server.sendHeader("Location", "/", true);
+    server.send(302, "text/plain", "");
+  });
+
+  server.begin();
+}
+
+// -----------------------------------------------------------------------------
+// Arduino setup / loop
+// -----------------------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  Serial.setDebugOutput(false); // keep serial channel clean for binary protocol
+  loadConfig();
+  applyNetworkConfig();
+  setupWeb();
+  addEventLog(String(F("Boot ")) + NR_FW_VERSION + F(" / ") + chipIdString());
+  lastHeartbeat = millis();
+}
+
+void loop() {
+  protoUpdate();
+  processMonitorEvents();
+
+  if (!monitorNetworkSuspended) {
+    if (dnsRunning) dnsServer.processNextRequest();
+    server.handleClient();
+    maintainNetwork();
+  }
+
+  if (millis() - lastHeartbeat >= NR_HEARTBEAT_MS) {
+    lastHeartbeat = millis();
+    sendEvent("heartbeat", String(F("\"uptime\":")) + millis() + F(",\"heap\":") + ESP.getFreeHeap());
+  }
+  yield();
+}
