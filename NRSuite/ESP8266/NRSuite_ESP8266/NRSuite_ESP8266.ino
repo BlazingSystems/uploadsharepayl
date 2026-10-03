@@ -926,4 +926,200 @@ static void fillStatus(JsonDocument& doc) {
 // -----------------------------------------------------------------------------
 // Command dispatcher
 // -----------------------------------------------------------------------------
-static bool isAnyOf(const char* cmd, const char* const*
+static bool isAnyOf(const char* cmd, const char* const* list, size_t n) {
+  for (size_t i = 0; i < n; ++i) if (strcmp(cmd, list[i]) == 0) return true;
+  return false;
+}
+
+static void handleCommand(uint8_t id, JsonDocument& doc) {
+  const char* cmd = doc["cmd"] | "";
+  if (!*cmd) {
+    bridge.sendResp(id, false, "missing cmd");
+    return;
+  }
+
+  if (strcmp(cmd, "PING") == 0) {
+    bridge.sendResp(id, true, "pong");
+    return;
+  }
+
+  if (strcmp(cmd, "STATUS") == 0 || strcmp(cmd, "HEAP") == 0) {
+    JsonDocument out;
+    fillStatus(out);
+    bridge.sendJson(NR_TYPE_RESP, id, out);
+    return;
+  }
+
+  if (strcmp(cmd, "STOP_ALL") == 0) {
+    stopMonitor(true);
+    bridge.sendResp(id, true, "all ESP8266 modules stopped");
+    return;
+  }
+
+  if (strcmp(cmd, "SET_CHANNEL") == 0) {
+    uint8_t ch = doc["args"]["channel"] | 1;
+    if (ch < 1 || ch > 13) {
+      bridge.sendResp(id, false, "invalid channel (must be 1-13)");
+      return;
+    }
+    monitorChannel = ch;
+    if (monitorMode != MON_NONE) wifi_set_channel(ch);
+    bridge.sendResp(id, true, "channel set");
+    return;
+  }
+
+  if (strcmp(cmd, "SCAN_WIFI") == 0) {
+    MonitorMode savedMode = monitorMode;
+    bool savedHop = monitorHop;
+    uint8_t savedChannel = monitorChannel;
+    uint16_t savedInterval = monitorHopIntervalMs;
+    int8_t savedRssi = monitorRssiMin;
+    if (monitorMode != MON_NONE) stopMonitor(true);
+    int n = scanWifiAndEmit();
+    if (savedMode != MON_NONE) startMonitor(savedMode, savedChannel, savedHop, savedInterval, savedRssi, 0);
+    if (n < 0) bridge.sendResp(id, false, "scan failed");
+    else {
+      JsonDocument out;
+      out["ok"] = true;
+      out["count"] = n;
+      bridge.sendJson(NR_TYPE_RESP, id, out);
+    }
+    return;
+  }
+
+  if (strcmp(cmd, "START_CLIENT_DETECT") == 0) {
+    const char* mode = doc["args"]["mode"] | "fixed";
+    bool hop = strcmp(mode, "hop") == 0;
+    uint8_t ch = doc["args"]["channel"] | 1;
+    uint16_t interval = doc["args"]["interval_ms"] | 300;
+    bool ok = startMonitor(MON_CLIENT, ch, hop, interval, -100, 0);
+    bridge.sendResp(id, ok, ok ? "client detection started" : "start failed");
+    return;
+  }
+
+  if (strcmp(cmd, "STOP_CLIENT_DETECT") == 0) {
+    uint32_t captured = monitorDetected, sent = monitorSent, dropped = monitorDropped;
+    stopMonitor(true);
+    JsonDocument out;
+    out["ok"] = true;
+    out["captured"] = captured;
+    out["sent"] = sent;
+    out["dropped"] = dropped;
+    bridge.sendJson(NR_TYPE_RESP, id, out);
+    return;
+  }
+
+  if (strcmp(cmd, "DEAUTH_DETECT_START") == 0) {
+    const char* mode = doc["args"]["mode"] | "fixed";
+    bool hop = strcmp(mode, "hop") == 0 || static_cast<bool>(doc["args"]["hop"] | false);
+    uint8_t ch = doc["args"]["channel"] | 1;
+    uint16_t interval = doc["args"]["interval_ms"] | 300;
+    int8_t rssi = doc["args"]["rssi_min"] | -100;
+    deauthFilterHasBssid = parseMacText(doc["args"]["bssid"] | "", deauthFilterBssid);
+    deauthFilterHasClient = parseMacText(doc["args"]["client"] | "", deauthFilterClient);
+    bool ok = startMonitor(MON_DEAUTH, ch, hop, interval, rssi, 0);
+    if (!ok) {
+      bridge.sendResp(id, false, "start failed");
+    } else {
+      JsonDocument out;
+      out["ok"] = true;
+      out["channel"] = monitorChannel;
+      out["hopping"] = monitorHop;
+      bridge.sendJson(NR_TYPE_RESP, id, out);
+    }
+    return;
+  }
+
+  if (strcmp(cmd, "DEAUTH_DETECT_STOP") == 0) {
+    uint32_t detected = monitorDetected, sent = monitorSent, dropped = monitorDropped;
+    stopMonitor(true);
+    JsonDocument out;
+    out["ok"] = true;
+    out["detected"] = detected;
+    out["sent"] = sent;
+    out["dropped"] = dropped;
+    bridge.sendJson(NR_TYPE_RESP, id, out);
+    return;
+  }
+
+  if (strcmp(cmd, "DEAUTH_DETECT_STATUS") == 0) {
+    JsonDocument out;
+    out["ok"] = true;
+    out["active"] = monitorMode == MON_DEAUTH;
+    out["hopping"] = monitorMode == MON_DEAUTH && monitorHop;
+    out["channel"] = monitorChannel;
+    out["detected"] = monitorDetected;
+    out["sent"] = monitorSent;
+    out["dropped"] = monitorDropped;
+    bridge.sendJson(NR_TYPE_RESP, id, out);
+    return;
+  }
+
+  if (strcmp(cmd, "START_HIDDEN_AP") == 0) {
+    const char* mode = doc["args"]["mode"] | "fixed";
+    bool hop = strcmp(mode, "hop") == 0;
+    uint8_t ch = doc["args"]["channel"] | 1;
+    uint16_t interval = doc["args"]["interval_ms"] | 300;
+    bool ok = startMonitor(MON_HIDDEN, ch, hop, interval, -100, 0);
+    bridge.sendResp(id, ok, ok ? "hidden AP detection started" : "start failed");
+    return;
+  }
+
+  if (strcmp(cmd, "STOP_HIDDEN_AP") == 0) {
+    uint32_t seen = hiddenSeen, candidates = hiddenCandidates, resolved = hiddenResolved;
+    uint32_t sent = monitorSent, dropped = monitorDropped;
+    stopMonitor(true);
+    JsonDocument out;
+    out["ok"] = true;
+    out["hidden"] = seen;
+    out["candidates"] = candidates;
+    out["resolved"] = resolved;
+    out["sent"] = sent;
+    out["dropped"] = dropped;
+    bridge.sendJson(NR_TYPE_RESP, id, out);
+    return;
+  }
+
+  // ESP32-only hardware modules. Keep the command names recognizable so the
+  // app gets a clean response instead of timing out on accidental invocation.
+  static const char* const chipOnly[] = {
+    "BLE_SCAN_START", "BLE_SCAN_STOP", "BLE_PROFILE_START", "BLE_PROFILE_STOP",
+    "BLE_START", "BLE_STATUS", "BLE_STOP", "BLE_RUN_SCRIPT", "BLE_STOP_SCRIPT",
+    "BLE_KEY_DOWN", "BLE_KEY_UP", "BLE_KEY_TAP", "BLE_TYPE_TEXT", "BLE_MOUSE_MOVE",
+    "BLE_MOUSE_SCROLL", "BLE_MOUSE_BUTTON", "BLE_MOUSE_RELEASE", "BLE_RELEASE_ALL",
+    "START_MSC", "MSC_SETUP", "START_BADUSB"
+  };
+  if (isAnyOf(cmd, chipOnly, sizeof(chipOnly) / sizeof(chipOnly[0]))) {
+    bridge.sendResp(id, false, "unsupported on ESP8266 hardware");
+    return;
+  }
+
+  // The ESP8266 port intentionally does not advertise active frame-injection,
+  // credential-collection portal, or raw-PCAP capture features. The Android app
+  // will therefore gate those modules from STATUS.features instead of exposing
+  // a control that cannot be safely/reliably matched on this target.
+  static const char* const notInBuild[] = {
+    "START_SNIFF", "STOP_SNIFF", "DEAUTH", "DEAUTH_CAPTURE",
+    "HIDDEN_AP_FORCE_RECONNECT", "START_BEACON", "STOP_BEACON", "BEACON_STATUS",
+    "START_PORTAL", "STOP_PORTAL", "RESET_HTML", "SET_HTML_CHUNK", "PORTAL_STATUS",
+    "MSC_LIST", "MSC_READ", "MSC_WRITE", "MSC_DELETE", "MSC_SPACE", "SET_FILE_CHUNK"
+  };
+  if (isAnyOf(cmd, notInBuild, sizeof(notInBuild) / sizeof(notInBuild[0]))) {
+    bridge.sendResp(id, false, "not available in ESP8266 compatibility build");
+    return;
+  }
+
+  bridge.sendResp(id, false, "unknown command");
+}
+
+// -----------------------------------------------------------------------------
+// Web UI
+// -----------------------------------------------------------------------------
+static bool webAuth() {
+  if (!cfg.webUser[0] && !cfg.webPass[0]) return true;
+  if (web.authenticate(cfg.webUser, cfg.webPass)) return true;
+  web.requestAuthentication(BASIC_AUTH, "NRSuite ESP8266");
+  return false;
+}
+
+static const char INDEX_HTML[] PROGMEM = 
