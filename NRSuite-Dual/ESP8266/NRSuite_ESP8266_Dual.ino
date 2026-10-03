@@ -758,3 +758,173 @@ void processMonitorEvents() {
 // -----------------------------------------------------------------------------
 // Wi-Fi scan
 // -----------------------------------------------------------------------------
+String scanJson(bool emitProtocolEvents, int* outCount = nullptr) {
+  if (monitorActive) {
+    if (outCount) *outCount = -1;
+    return F("{\"ok\":false,\"msg\":\"stop passive monitor before scanning\"}");
+  }
+
+  WiFiMode_t before = WiFi.getMode();
+  if (before == WIFI_AP) WiFi.mode(WIFI_AP_STA);
+  int n = WiFi.scanNetworks(false, true);
+  if (n < 0) n = 0;
+  int limit = min(n, NR_MAX_SCAN_RESULTS);
+  if (outCount) *outCount = limit;
+
+  String j = F("{\"ok\":true,\"networks\":[");
+  for (int i = 0; i < limit; ++i) {
+    if (i) j += ',';
+    String ssid = WiFi.SSID(i);
+    String bssid = WiFi.BSSIDstr(i);
+    String sec = encName(WiFi.encryptionType(i));
+    int ch = WiFi.channel(i);
+    int rssi = WiFi.RSSI(i);
+    j += String(F("{\"ssid\":\"")) + jsonEscape(ssid) +
+         F("\",\"bssid\":\"") + bssid +
+         F("\",\"channel\":") + ch +
+         F(",\"rssi\":") + rssi +
+         F(",\"security\":\"") + sec + F("\",\"wps\":false}");
+
+    if (emitProtocolEvents) {
+      String fields = String(F("\"ssid\":\"")) + jsonEscape(ssid) +
+        F("\",\"bssid\":\"") + bssid +
+        F("\",\"channel\":") + ch +
+        F(",\"rssi\":") + rssi +
+        F(",\"security\":\"") + sec + F("\",\"wps\":false");
+      sendEvent("scan_ap", fields);
+      yield();
+    }
+  }
+  j += F("]}");
+  WiFi.scanDelete();
+  if (before == WIFI_AP && cfg.netMode == NET_AP) WiFi.mode(WIFI_AP);
+  return j;
+}
+
+// -----------------------------------------------------------------------------
+// Status / command bridge
+// -----------------------------------------------------------------------------
+String statusJson() {
+  String features = F("[\"wifi\",\"deauth_detect\",\"hidden_ap\",\"stop_all\",\"webui\",\"repeater\"]");
+  String j = F("{\"ok\":true");
+  j += F(",\"uptime\":") + String(millis());
+  j += F(",\"heap\":") + String(ESP.getFreeHeap());
+  j += F(",\"chip\":\"ESP8266\"");
+  j += F(",\"proto\":") + String(NR_PROTO_MAJOR);
+  j += F(",\"fw\":\"") + String(NR_FW_VERSION) + '"';
+  j += F(",\"device_id\":\"") + chipIdString() + '"';
+  j += F(",\"features\":") + features;
+  j += F(",\"sniffing\":false,\"client_detecting\":false,\"portal\":false,\"beacon\":false");
+  j += F(",\"deauth_detector\":") + String((monitorActive && monitorMode == MON_DEAUTH) ? F("true") : F("false"));
+  j += F(",\"hidden_ap\":") + String((monitorActive && monitorMode == MON_HIDDEN) ? F("true") : F("false"));
+  j += F(",\"ble_scanning\":false,\"ble_profiling\":false");
+  j += F(",\"oversized_frames\":") + String(protoOversized);
+  j += F(",\"deauth_detector_channel\":") + String(monitorChannel);
+  j += F(",\"deauth_detector_hopping\":") + String(monitorHop ? F("true") : F("false"));
+  j += F(",\"deauth_detected\":") + String(deauthDetected);
+  j += F(",\"deauth_detector_dropped\":") + String(deauthDropped);
+  j += F(",\"hidden_ap_channel\":") + String(monitorChannel);
+  j += F(",\"hidden_ap_hopping\":") + String(monitorHop ? F("true") : F("false"));
+  j += F(",\"hidden_ap_seen\":") + String(hiddenSeen);
+  j += F(",\"hidden_ap_dropped\":") + String(hiddenDropped);
+  j += F(",\"network_mode\":\"") + String(netModeName(cfg.netMode)) + '"';
+  j += F(",\"sta_connected\":") + String(WiFi.status() == WL_CONNECTED ? F("true") : F("false"));
+  j += F(",\"sta_ip\":\"") + WiFi.localIP().toString() + '"';
+  j += F(",\"ap_ip\":\"") + WiFi.softAPIP().toString() + '"';
+  j += F(",\"napt\":") + String(naptEnabled ? F("true") : F("false"));
+  j += F(",\"fallback_ap\":") + String(fallbackAp ? F("true") : F("false"));
+#if IP_NAPT
+  j += F(",\"napt_compiled\":true");
+#else
+  j += F(",\"napt_compiled\":false");
+#endif
+  j += '}';
+  return j;
+}
+
+void handleProtocolCommand(uint8_t id, const String& payload) {
+  String cmd = jsonStringValue(payload, "cmd", "");
+  if (!cmd.length()) { sendResponse(id, false, "", F("missing cmd")); return; }
+
+  if (cmd == "PING") {
+    sendResponse(id, true, "", F("pong"));
+    return;
+  }
+  if (cmd == "STATUS" || cmd == "HEAP") {
+    sendJsonFrame(TYPE_RESP, id, statusJson());
+    return;
+  }
+  if (cmd == "STOP_ALL") {
+    stopMonitor(true);
+    sendResponse(id, true);
+    return;
+  }
+  if (cmd == "SET_CHANNEL") {
+    int ch = (int)jsonIntValue(payload, "channel", 1);
+    if (ch < 1 || ch > 13) { sendResponse(id, false, "", F("channel must be 1..13")); return; }
+    if (monitorActive) {
+      wifi_promiscuous_enable(0);
+      wifi_set_channel(ch);
+      monitorChannel = ch;
+      wifi_promiscuous_enable(1);
+    }
+    cfg.apChannel = ch;
+    sendResponse(id, true, String(F("\"channel\":")) + ch);
+    return;
+  }
+  if (cmd == "SCAN_WIFI") {
+    int count = 0;
+    String result = scanJson(true, &count);
+    if (count < 0) sendResponse(id, false, "", F("stop passive monitor before scanning"));
+    else sendResponse(id, true, String(F("\"count\":")) + count);
+    return;
+  }
+  if (cmd == "DEAUTH_DETECT_START") {
+    String mode = jsonStringValue(payload, "mode", "fixed");
+    bool hop = jsonBoolValue(payload, "hop", mode == "hop");
+    int ch = (int)jsonIntValue(payload, "channel", wifi_get_channel());
+    int interval = (int)jsonIntValue(payload, "interval_ms", NR_MON_DEFAULT_MS);
+    bool ok = startMonitor(MON_DEAUTH, ch, hop, interval, false);
+    sendResponse(id, ok, String(F("\"channel\":")) + monitorChannel + F(",\"hopping\":") + (monitorHop ? F("true") : F("false")));
+    return;
+  }
+  if (cmd == "DEAUTH_DETECT_STOP") {
+    stopMonitor(true);
+    sendResponse(id, true, String(F("\"detected\":")) + deauthDetected + F(",\"sent\":") + deauthDetected + F(",\"dropped\":") + deauthDropped);
+    return;
+  }
+  if (cmd == "DEAUTH_DETECT_STATUS") {
+    sendResponse(id, true,
+      String(F("\"active\":")) + ((monitorActive && monitorMode == MON_DEAUTH) ? F("true") : F("false")) +
+      F(",\"hopping\":") + (monitorHop ? F("true") : F("false")) +
+      F(",\"channel\":") + String((int)monitorChannel) +
+      F(",\"detected\":") + deauthDetected +
+      F(",\"sent\":") + deauthDetected +
+      F(",\"dropped\":") + deauthDropped);
+    return;
+  }
+  if (cmd == "START_HIDDEN_AP") {
+    String mode = jsonStringValue(payload, "mode", "fixed");
+    bool hop = jsonBoolValue(payload, "hop", mode == "hop");
+    int ch = (int)jsonIntValue(payload, "channel", wifi_get_channel());
+    int interval = (int)jsonIntValue(payload, "interval_ms", NR_MON_DEFAULT_MS);
+    bool ok = startMonitor(MON_HIDDEN, ch, hop, interval, false);
+    sendResponse(id, ok, String(F("\"channel\":")) + monitorChannel + F(",\"hopping\":") + (monitorHop ? F("true") : F("false")));
+    return;
+  }
+  if (cmd == "STOP_HIDDEN_AP") {
+    stopMonitor(true);
+    sendResponse(id, true,
+      String(F("\"hidden\":")) + hiddenSeen +
+      F(",\"candidates\":0,\"resolved\":0,\"sent\":") + hiddenSeen +
+      F(",\"dropped\":") + hiddenDropped);
+    return;
+  }
+
+  // Explicitly reject active/disruptive upstream commands.
+  if (cmd == "DEAUTH" || cmd == "DEAUTH_CAPTURE" || cmd == "START_BEACON" ||
+      cmd == "START_PORTAL" || cmd == "RESET_HTML" || cmd == "SET_HTML_CHUNK") {
+    sendResponse(id, false, "", F("disabled in ESP8266 defensive port"));
+    return;
+  }
+
