@@ -568,3 +568,193 @@ void maintainNetwork() {
   if (cfg.netMode == NET_STA || cfg.netMode == NET_APSTA || cfg.netMode == NET_REPEATER) {
     if (strlen(cfg.staSsid) && WiFi.status() != WL_CONNECTED && millis() - lastStaRetry > 15000UL) {
       lastStaRetry = millis();
+      WiFi.begin(cfg.staSsid, cfg.staPass);
+    }
+    if (cfg.netMode == NET_REPEATER && WiFi.status() == WL_CONNECTED && !naptEnabled) {
+      enableNapt();
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Promiscuous monitor (passive only)
+// ESP8266 callback prepends a 12-byte RxControl block to management payloads.
+// Keep callback tiny: no String, no heap allocation, no Serial.
+// -----------------------------------------------------------------------------
+void ICACHE_RAM_ATTR queueMonitorEvent(const MonitorEvent& e) {
+  uint8_t next = (uint8_t)((monHead + 1) % NR_MON_QUEUE_SIZE);
+  if (next == monTail) {
+    if (e.kind <= 2) deauthDropped++;
+    else hiddenDropped++;
+    return;
+  }
+  memcpy((void*)&monQueue[monHead], &e, sizeof(e));
+  monHead = next;
+}
+
+void ICACHE_RAM_ATTR promiscCb(uint8_t* buff, uint16_t len) {
+  if (!monitorActive || !buff || len < 12 + 24) return;
+  const uint8_t* p = buff + 12;
+  uint16_t plen = len - 12;
+  uint8_t fc0 = p[0];
+  uint8_t type = (fc0 >> 2) & 0x3;
+  if (type != 0) return; // management frames only
+  uint8_t subtype = (fc0 >> 4) & 0x0F;
+
+  if (monitorMode == MON_DEAUTH) {
+    if (subtype != 0x0C && subtype != 0x0A) return;
+    MonitorEvent e{};
+    e.kind = (subtype == 0x0C) ? 1 : 2;
+    e.rssi = (int8_t)buff[0];
+    e.channel = monitorChannel;
+    e.uptime = millis();
+    memcpy(e.dst, p + 4, 6);
+    memcpy(e.src, p + 10, 6);
+    memcpy(e.bssid, p + 16, 6);
+    if (plen >= 26) e.reason = (uint16_t)p[24] | ((uint16_t)p[25] << 8);
+    queueMonitorEvent(e);
+    return;
+  }
+
+  if (monitorMode == MON_HIDDEN) {
+    if (subtype != 0x08 && subtype != 0x05) return; // beacon / probe response
+    if (plen < 38) return;
+    size_t off = 36; // 24-byte mgmt header + 12-byte beacon/probe fixed body
+    bool ssidSeen = false;
+    uint8_t ssidLen = 0;
+    while (off + 2 <= plen) {
+      uint8_t id = p[off];
+      uint8_t ilen = p[off + 1];
+      if (off + 2 + ilen > plen) break;
+      if (id == 0) {
+        ssidSeen = true;
+        ssidLen = ilen;
+        break;
+      }
+      off += 2 + ilen;
+    }
+    if (ssidSeen && ssidLen > 0) return;
+    MonitorEvent e{};
+    e.kind = 3;
+    e.rssi = (int8_t)buff[0];
+    e.channel = monitorChannel;
+    e.uptime = millis();
+    memcpy(e.bssid, p + 16, 6);
+    queueMonitorEvent(e);
+  }
+}
+
+bool suspendNetworkForHopping() {
+  if (monitorNetworkSuspended) return true;
+  monitorSavedMode = (NetMode)cfg.netMode;
+  stopDns();
+  disableNapt();
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+  delay(30);
+  monitorNetworkSuspended = true;
+  return true;
+}
+
+bool startMonitor(MonitorMode mode, uint8_t channel, bool hop, uint16_t hopMs, bool fromWeb) {
+  stopMonitor(true);
+  if (channel < 1 || channel > 13) channel = 1;
+  hopMs = constrain(hopMs, (uint16_t)100, (uint16_t)5000);
+
+  if (hop) {
+    // Channel hopping and live AP/STA cannot coexist on ESP8266's single radio.
+    // Preserve Android serial control while temporarily suspending web networking.
+    suspendNetworkForHopping();
+    channel = 1;
+  } else {
+    // If connected, fixed monitoring must stay on the radio's current channel.
+    uint8_t current = wifi_get_channel();
+    if (current >= 1 && current <= 13) channel = current;
+  }
+
+  wifi_promiscuous_enable(0);
+  wifi_set_promiscuous_rx_cb(promiscCb);
+  wifi_set_channel(channel);
+  monitorMode = mode;
+  monitorChannel = channel;
+  monitorHop = hop;
+  monitorHopMs = hopMs;
+  monHead = monTail = 0;
+  monitorLastHop = millis();
+  monitorStarted = millis();
+  monitorStartedFromWeb = fromWeb;
+  monitorActive = true;
+  wifi_promiscuous_enable(1);
+  addEventLog(String(F("Passive monitor started: ")) + (mode == MON_DEAUTH ? F("deauth") : F("hidden AP")));
+  return true;
+}
+
+void stopMonitor(bool restoreNetwork) {
+  if (monitorActive) wifi_promiscuous_enable(0);
+  monitorActive = false;
+  monitorMode = MON_NONE;
+  monitorHop = false;
+  monHead = monTail = 0;
+  bool suspended = monitorNetworkSuspended;
+  monitorNetworkSuspended = false;
+  if (restoreNetwork && suspended) applyNetworkConfig(true);
+}
+
+void processMonitorEvents() {
+  if (monitorActive && monitorHop && millis() - monitorLastHop >= monitorHopMs) {
+    monitorLastHop = millis();
+    uint8_t c = monitorChannel + 1;
+    if (c > 13) c = 1;
+    wifi_promiscuous_enable(0);
+    wifi_set_channel(c);
+    monitorChannel = c;
+    wifi_promiscuous_enable(1);
+    if (monitorMode == MON_DEAUTH) sendEvent("deauth_detector_hop", String(F("\"channel\":")) + c);
+    else sendEvent("hidden_ap_hop", String(F("\"channel\":")) + c);
+  }
+
+  // Web-triggered hopping auto-stops so the browser cannot strand the user indefinitely.
+  if (monitorActive && monitorHop && monitorStartedFromWeb && millis() - monitorStarted > NR_WEB_MON_TIMEOUT) {
+    stopMonitor(true);
+    addEventLog(F("Web monitor timeout; network restored"));
+  }
+
+  while (monTail != monHead) {
+    noInterrupts();
+    MonitorEvent e{};
+    memcpy(&e, (const void*)&monQueue[monTail], sizeof(e));
+    monTail = (uint8_t)((monTail + 1) % NR_MON_QUEUE_SIZE);
+    interrupts();
+
+    if (e.kind == 1 || e.kind == 2) {
+      deauthDetected++;
+      String subtype = (e.kind == 1) ? F("deauth") : F("disassoc");
+      String fields = String(F("\"subtype\":\"")) + subtype +
+        F("\",\"subtype_code\":") + String(e.kind == 1 ? 12 : 10) +
+        F(",\"bssid\":\"") + macString(e.bssid) +
+        F("\",\"source\":\"") + macString(e.src) +
+        F("\",\"client\":\"") + macString(e.dst) +
+        F("\",\"destination\":\"") + macString(e.dst) +
+        F("\",\"channel\":") + String(e.channel) +
+        F(",\"rssi\":") + String(e.rssi) +
+        F(",\"reason\":") + String(e.reason) +
+        F(",\"uptime_ms\":") + String(e.uptime);
+      sendEvent("deauth_detected", fields);
+      addEventLog(String(F("Deauth alert ch")) + e.channel + F(" ") + macString(e.bssid));
+    } else if (e.kind == 3) {
+      hiddenSeen++;
+      String fields = String(F("\"bssid\":\"")) + macString(e.bssid) +
+        F("\",\"channel\":") + String(e.channel) +
+        F(",\"rssi\":") + String(e.rssi) +
+        F(",\"uptime_ms\":") + String(e.uptime);
+      sendEvent("hidden_ap", fields);
+      addEventLog(String(F("Hidden AP ch")) + e.channel + F(" ") + macString(e.bssid));
+    }
+    yield();
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Wi-Fi scan
+// -----------------------------------------------------------------------------
