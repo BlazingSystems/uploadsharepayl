@@ -236,4 +236,251 @@ public:
     h[2] = type;
     h[3] = id;
     h[4] = len & 0xFF;
-    h[5]
+    h[5] = (len >> 8) & 0xFF;
+    h[6] = (len >> 16) & 0xFF;
+    h[7] = (len >> 24) & 0xFF;
+    _stream->write(h, sizeof(h));
+    if (len && payload) _stream->write(payload, len);
+  }
+
+private:
+  Stream* _stream = nullptr;
+  CommandHandler _handler = nullptr;
+  uint8_t _rx[NR_RX_BUF_SIZE];
+  size_t _rxLen = 0;
+  uint32_t _oversized = 0;
+
+  bool tryParse() {
+    if (_rxLen < NR_PROTO_HEADER_SZ) return false;
+    if (_rx[0] != NR_PROTO_MAGIC_0 || _rx[1] != NR_PROTO_MAGIC_1) {
+      resync();
+      return _rxLen >= NR_PROTO_HEADER_SZ;
+    }
+
+    uint8_t type = _rx[2];
+    uint8_t id = _rx[3];
+    uint32_t len = static_cast<uint32_t>(_rx[4])
+                 | (static_cast<uint32_t>(_rx[5]) << 8)
+                 | (static_cast<uint32_t>(_rx[6]) << 16)
+                 | (static_cast<uint32_t>(_rx[7]) << 24);
+
+    if (len > NR_PROTO_MAX_CHUNK) {
+      ++_oversized;
+      resync();
+      return true;
+    }
+
+    size_t total = NR_PROTO_HEADER_SZ + len;
+    if (_rxLen < total) return false;
+
+    if (type == NR_TYPE_CMD && _handler) {
+      JsonDocument doc;
+      DeserializationError err = deserializeJson(doc, _rx + NR_PROTO_HEADER_SZ, len);
+      if (!err) {
+        _handler(id, doc);
+      } else {
+        sendResp(id, false, "parse error");
+      }
+    }
+
+    memmove(_rx, _rx + total, _rxLen - total);
+    _rxLen -= total;
+    return true;
+  }
+
+  void resync() {
+    if (_rxLen == 0) return;
+    for (size_t i = 1; i + 1 < _rxLen; ++i) {
+      if (_rx[i] == NR_PROTO_MAGIC_0 && _rx[i + 1] == NR_PROTO_MAGIC_1) {
+        memmove(_rx, _rx + i, _rxLen - i);
+        _rxLen -= i;
+        return;
+      }
+    }
+    if (_rx[_rxLen - 1] == NR_PROTO_MAGIC_0) {
+      _rx[0] = NR_PROTO_MAGIC_0;
+      _rxLen = 1;
+    } else {
+      _rxLen = 0;
+    }
+  }
+};
+
+NrBridge bridge;
+
+// -----------------------------------------------------------------------------
+// Passive Wi-Fi monitor engine
+// -----------------------------------------------------------------------------
+enum MonitorMode : uint8_t {
+  MON_NONE = 0,
+  MON_CLIENT = 1,
+  MON_DEAUTH = 2,
+  MON_HIDDEN = 3
+};
+
+enum MonitorEventType : uint8_t {
+  EV_NONE = 0,
+  EV_CLIENT = 1,
+  EV_DEAUTH = 2,
+  EV_HIDDEN_AP = 3,
+  EV_HIDDEN_CANDIDATE = 4,
+  EV_HIDDEN_RESOLVED = 5,
+  EV_HOP = 6
+};
+
+struct MonitorEvent {
+  uint8_t type;
+  uint8_t subtype;
+  uint8_t channel;
+  int8_t rssi;
+  uint16_t reason;
+  uint32_t uptimeMs;
+  uint8_t addr1[6];
+  uint8_t addr2[6];
+  uint8_t bssid[6];
+  char ssid[33];
+};
+
+struct HiddenCacheEntry {
+  bool used;
+  uint8_t bssid[6];
+  uint32_t lastSeen;
+};
+
+volatile uint8_t pendingHead = 0;
+volatile uint8_t pendingTail = 0;
+MonitorEvent pendingEvents[NR_MAX_PENDING_EVENTS];
+HiddenCacheEntry hiddenCache[NR_HIDDEN_CACHE];
+
+MonitorMode monitorMode = MON_NONE;
+bool monitorHop = false;
+uint8_t monitorChannel = 1;
+uint16_t monitorHopIntervalMs = 300;
+int8_t monitorRssiMin = -100;
+uint32_t monitorLastHop = 0;
+uint32_t monitorAutoStopAt = 0;
+uint32_t monitorDetected = 0;
+uint32_t monitorSent = 0;
+uint32_t monitorDropped = 0;
+uint32_t hiddenSeen = 0;
+uint32_t hiddenCandidates = 0;
+uint32_t hiddenResolved = 0;
+bool deauthFilterHasBssid = false;
+bool deauthFilterHasClient = false;
+uint8_t deauthFilterBssid[6] = {0};
+uint8_t deauthFilterClient[6] = {0};
+
+// Browser requests must be acknowledged before radio-monitor mode tears down
+// the AP/STA interface that carried the HTTP request.
+bool pendingWebMonitorStart = false;
+MonitorMode pendingWebMonitorMode = MON_NONE;
+uint8_t pendingWebMonitorChannel = 1;
+bool pendingWebMonitorHop = false;
+uint32_t pendingWebMonitorDurationMs = 0;
+uint32_t pendingWebMonitorStartAt = 0;
+
+static bool parseMacText(const char* text, uint8_t out[6]) {
+  if (!text || !*text || !out) return false;
+  unsigned int b[6];
+  if (sscanf(text, "%x:%x:%x:%x:%x:%x",
+             &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) return false;
+  for (uint8_t i = 0; i < 6; ++i) {
+    if (b[i] > 0xFF) return false;
+    out[i] = static_cast<uint8_t>(b[i]);
+  }
+  return true;
+}
+
+static void macToString(const uint8_t* mac, char* out) {
+  snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static bool parseSsidIe(const uint8_t* frame, size_t frameLen, size_t offset,
+                        char* out, size_t outSize, bool* present) {
+  if (present) *present = false;
+  if (!frame || !out || outSize < 2) return false;
+  out[0] = '\0';
+  while (offset + 2 <= frameLen) {
+    uint8_t id = frame[offset];
+    uint8_t ieLen = frame[offset + 1];
+    if (offset + 2 + ieLen > frameLen) break;
+    if (id == 0) {
+      if (present) *present = true;
+      size_t n = min(static_cast<size_t>(ieLen), outSize - 1);
+      if (n) memcpy(out, frame + offset + 2, n);
+      out[n] = '\0';
+      return n > 0;
+    }
+    offset += 2 + ieLen;
+  }
+  return false;
+}
+
+static bool queueMonitorEvent(const MonitorEvent& ev) {
+  uint8_t next = (pendingHead + 1) % NR_MAX_PENDING_EVENTS;
+  if (next == pendingTail) {
+    ++monitorDropped;
+    return false;
+  }
+  pendingEvents[pendingHead] = ev;
+  pendingHead = next;
+  return true;
+}
+
+static void promiscuousCb(uint8_t* buf, uint16_t len) {
+  if (monitorMode == MON_NONE || !buf || len <= sizeof(RxControl)) return;
+
+  RxControl* rx = reinterpret_cast<RxControl*>(buf);
+  const uint8_t* frame = buf + sizeof(RxControl);
+  size_t frameLen = len - sizeof(RxControl);
+  if (frameLen < 24) return;
+
+  uint8_t fc0 = frame[0];
+  uint8_t type = (fc0 >> 2) & 0x03;
+  if (type != 0) return; // management frames only for reliability on ESP8266
+
+  uint8_t subtype = (fc0 >> 4) & 0x0F;
+  int8_t rssi = rx->rssi;
+  if (rssi < monitorRssiMin) return;
+
+  MonitorEvent ev{};
+  ev.subtype = subtype;
+  ev.channel = wifi_get_channel();
+  ev.rssi = rssi;
+  ev.uptimeMs = millis();
+  memcpy(ev.addr1, frame + 4, 6);
+  memcpy(ev.addr2, frame + 10, 6);
+  memcpy(ev.bssid, frame + 16, 6);
+
+  if (monitorMode == MON_DEAUTH) {
+    if (subtype != 0x0C && subtype != 0x0A) return;
+    ev.type = EV_DEAUTH;
+    if (frameLen >= 26) ev.reason = frame[24] | (static_cast<uint16_t>(frame[25]) << 8);
+    queueMonitorEvent(ev);
+    return;
+  }
+
+  if (monitorMode == MON_CLIENT) {
+    if (subtype != 0x04 && subtype != 0x00 && subtype != 0x02 && subtype != 0x0B) return;
+    ev.type = EV_CLIENT;
+    bool present = false;
+    if (subtype == 0x04) parseSsidIe(frame, frameLen, 24, ev.ssid, sizeof(ev.ssid), &present);
+    else if (subtype == 0x00) parseSsidIe(frame, frameLen, 28, ev.ssid, sizeof(ev.ssid), &present);
+    else if (subtype == 0x02) parseSsidIe(frame, frameLen, 34, ev.ssid, sizeof(ev.ssid), &present);
+    queueMonitorEvent(ev);
+    return;
+  }
+
+  if (monitorMode == MON_HIDDEN) {
+    if (subtype == 0x08 || subtype == 0x05) {
+      if (frameLen < 36) return;
+      bool present = false;
+      bool hasSsid = parseSsidIe(frame, frameLen, 36, ev.ssid, sizeof(ev.ssid), &present);
+      if (hasSsid) return;
+      ev.type = EV_HIDDEN_AP;
+      queueMonitorEvent(ev);
+      return;
+    }
+    if (subtype == 0x04) {
+      
